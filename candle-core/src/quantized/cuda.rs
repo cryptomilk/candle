@@ -501,6 +501,67 @@ fn mul_mat_via_q8_1(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+/// `qi` (the MMVQ `QI*` constant) and `vdr` (`VDR_*_Q8_1_MMVQ`) for `dtype`,
+/// taken verbatim from `quantized.cu`. Mirrors
+/// `quantized/rocm/moe.rs::qi_vdr`.
+fn moe_qi_vdr(dtype: GgmlDType) -> Option<(usize, usize)> {
+    let pair = match dtype {
+        GgmlDType::Q2K => (16, 1),
+        GgmlDType::Q3K => (16, 1),
+        GgmlDType::Q4K => (32, 2),
+        GgmlDType::Q5K => (32, 2),
+        GgmlDType::Q6K => (32, 1),
+        GgmlDType::Q8_0 => (8, 2),
+        _ => return None,
+    };
+    Some(pair)
+}
+
+/// Kernel entry point and `nwarps` for `dtype` at reduction width `k`.
+///
+/// See `quantized/rocm/moe.rs::kernel_for` for why `nwarps` depends on `k`:
+/// `indexed_moe_forward`'s reduction stride is `vdr * nwarps * WARP_SIZE /
+/// qi`, and at `nwarps = 4` that can exceed `k`'s block count, leaving whole
+/// warps with nothing to do.
+fn moe_kernel_for(dtype: GgmlDType, k: usize) -> Option<(&'static str, u32)> {
+    let (name_nw4, name_nw1) = match dtype {
+        GgmlDType::Q2K => (
+            "indexed_moe_forward_q2k_q8_1",
+            "indexed_moe_forward_q2k_q8_1_nw1",
+        ),
+        GgmlDType::Q3K => (
+            "indexed_moe_forward_q3k_q8_1",
+            "indexed_moe_forward_q3k_q8_1_nw1",
+        ),
+        GgmlDType::Q4K => (
+            "indexed_moe_forward_q4k_q8_1",
+            "indexed_moe_forward_q4k_q8_1_nw1",
+        ),
+        GgmlDType::Q5K => (
+            "indexed_moe_forward_q5k_q8_1",
+            "indexed_moe_forward_q5k_q8_1_nw1",
+        ),
+        GgmlDType::Q6K => (
+            "indexed_moe_forward_q6k_q8_1",
+            "indexed_moe_forward_q6k_q8_1_nw1",
+        ),
+        GgmlDType::Q8_0 => (
+            "indexed_moe_forward_q8_0_q8_1",
+            "indexed_moe_forward_q8_0_q8_1_nw1",
+        ),
+        _ => return None,
+    };
+    let (qi, vdr) = moe_qi_vdr(dtype)?;
+    let qk = dtype.block_size();
+    let blocks_per_row = k / qk;
+    let nwarps4_fits = vdr * 4 * WARP_SIZE / qi <= blocks_per_row;
+    if nwarps4_fits {
+        Some((name_nw4, 4))
+    } else {
+        Some((name_nw1, 1))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn indexed_moe_forward_fused_q8_1_input(
     weight: &CudaView<u8>,
@@ -539,19 +600,13 @@ fn indexed_moe_forward_fused_q8_1_input(
     let outsize = batch * topk * n;
     let out = dev.alloc_zeros::<f32>(outsize)?;
 
-    let kernel_name = match w_dtype {
-        GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
-        GgmlDType::Q3K => "indexed_moe_forward_q3k_q8_1",
-        GgmlDType::Q4K => "indexed_moe_forward_q4k_q8_1",
-        GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
-        GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
-        GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
-        _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
+    let (kernel_name, nwarps) = match moe_kernel_for(w_dtype, k) {
+        Some(plan) => plan,
+        None => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
-    let (nblocks, nwarps) = (n as u32, 4);
     let cfg = cudarc::driver::LaunchConfig {
-        grid_dim: (nblocks, batch as u32, topk as u32),
+        grid_dim: (n as u32, batch as u32, topk as u32),
         block_dim: (WARP_SIZE as u32, nwarps, 1),
         shared_mem_bytes: 0,
     };
