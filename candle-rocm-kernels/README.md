@@ -48,7 +48,7 @@ comparison operators need.
 |---|---|
 | `hip_compat.h` | Force-included. 16-bit `atomicAdd`, `__dp4a`, `__vsubss4`, `*_sync` shuffle wrappers, `__syncwarp` |
 | `cuda_fp16.h` | `#include <hip/hip_fp16.h>` |
-| `cuda_bf16.h` | HIP bf16, plus the `__nv_bfloat16` alias and `__hmax_nan`/`__hmin_nan` |
+| `cuda_bf16.h` | HIP bf16, plus the `__nv_bfloat16` alias, `__hmax_nan`/`__hmin_nan`, and `__float2bfloat16_rn` |
 | `cuda_fp8.h` | Maps `__nv_fp8_e4m3` onto HIP's OCP `__hip_fp8_e4m3` |
 | `cuda.h` | Empty; the driver API is unused in device code |
 | `cuda/std/limits` | Aliases `cuda::std` onto `std` for `reduce.cu` |
@@ -75,10 +75,14 @@ and the block from `nwarps`, so the choice is readable back through
 
 The `*_sync` wrappers exist because HIP's own `__shfl_*_sync` and `__syncwarp`
 take a **64-bit** lane mask and `static_assert` on CUDA's 32-bit `0xffffffff`.
-The macros drop the mask and forward to the whole-wavefront form. `__syncwarp`
-forwards to HIP's function rather than to `__builtin_amdgcn_wave_barrier()`:
-HIP brackets the barrier with release/acquire wavefront fences, and the bare
-builtin is a scheduling barrier with no memory ordering.
+The macros drop the mask and forward to the whole-wavefront form. They're also
+variadic: CUDA's shuffles take an optional trailing `width` (defaulting to
+`warpSize`, always 32 on CUDA), and since HIP's `warpSize` is 64 on CDNA, an
+omitted width defaults to the literal `32` rather than forwarding to HIP's own
+`warpSize`. `__syncwarp` forwards to HIP's function rather than to
+`__builtin_amdgcn_wave_barrier()`: HIP brackets the barrier with
+release/acquire wavefront fences, and the bare builtin is a scheduling barrier
+with no memory ordering.
 
 ## Compilation and caching
 
