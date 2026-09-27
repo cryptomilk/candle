@@ -4709,7 +4709,7 @@ extern "C" __global__ void MMQ_LAUNCH_BOUNDS(Q6_K)
  * @param input_task_stride_bytes The stride in bytes to get from one quantized input vector to the next.
  * @param output_task_stride_elems The stride in elements (f32) to get from one output vector to the next.
  */
-template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda, int nwarps>
 __device__ void indexed_moe_forward(
     const void * __restrict__ all_weights,
     const void * __restrict__ all_inputs,
@@ -4758,7 +4758,6 @@ __device__ void indexed_moe_forward(
 
     //fixed for inner compute
     constexpr int ncols_y = 1;
-    constexpr int nwarps = 4;
     constexpr int rows_per_cuda_block = 1;
 
     const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
@@ -4784,7 +4783,10 @@ __device__ void indexed_moe_forward(
     }
 
     // --- Inter-warp reduction using shared memory ---
-    __shared__ float tmp_shared[nwarps - 1][WARP_SIZE];
+    // `nwarps-1 > 0 ? nwarps-1 : 1`: mirrors `mul_mat_vec_q`'s guard against a
+    // zero-sized array when nwarps == 1, where this buffer is declared but
+    // never indexed.
+    __shared__ float tmp_shared[nwarps - 1 > 0 ? nwarps - 1 : 1][WARP_SIZE];
     if (threadIdx.y > 0) {
         tmp_shared[threadIdx.y - 1][threadIdx.x] = tmp;
     }
@@ -4801,92 +4803,38 @@ __device__ void indexed_moe_forward(
     }
 }
 
-extern "C" __global__ void indexed_moe_forward_q2k_q8_1(
-    const void * __restrict__ all_weights,
-    const void * __restrict__ all_inputs,
-    const unsigned int * __restrict__ indices,
-    float * __restrict__ all_outputs,
-    const int n,
-    const int k,
-    const int batch,
-    const int topk,
-    const int k_padded,
-    const int input_dim1) {
-    indexed_moe_forward<QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+// `NW` picks the warp count: 4 keeps every existing entry point's behavior
+// unchanged; `_nw1` variants exist so the host can fall back to nwarps=1 when
+// `k` is too small for 4 warps to all find work (see `rocm/moe.rs::kernel_for`
+// / `cuda.rs::indexed_moe_forward_fused_q8_1_input`).
+#define INDEXED_MOE_FWD(SUFFIX, QK, QI, BLOCK, VDR, VEC_DOT, NW) \
+extern "C" __global__ void indexed_moe_forward_##SUFFIX( \
+    const void * __restrict__ all_weights, \
+    const void * __restrict__ all_inputs, \
+    const unsigned int * __restrict__ indices, \
+    float * __restrict__ all_outputs, \
+    const int n, \
+    const int k, \
+    const int batch, \
+    const int topk, \
+    const int k_padded, \
+    const int input_dim1) { \
+    indexed_moe_forward<QK, QI, BLOCK, VDR, VEC_DOT, NW> \
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1); \
 }
 
-extern "C" __global__ void indexed_moe_forward_q3k_q8_1(
-    const void * __restrict__ all_weights,
-    const void * __restrict__ all_inputs,
-    const unsigned int * __restrict__ indices,
-    float * __restrict__ all_outputs,
-    const int n,
-    const int k,
-    const int batch,
-    const int topk,
-    const int k_padded,
-    const int input_dim1) {
-    indexed_moe_forward<QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
-}
+INDEXED_MOE_FWD(q2k_q8_1,     QK_K,  QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1, 4)
+INDEXED_MOE_FWD(q3k_q8_1,     QK_K,  QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1, 4)
+INDEXED_MOE_FWD(q4k_q8_1,     QK_K,  QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 4)
+INDEXED_MOE_FWD(q5k_q8_1,     QK_K,  QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1, 4)
+INDEXED_MOE_FWD(q6k_q8_1,     QK_K,  QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1, 4)
+INDEXED_MOE_FWD(q8_0_q8_1,    QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1, 4)
 
-extern "C" __global__ void indexed_moe_forward_q4k_q8_1(
-    const void * __restrict__ all_weights,
-    const void * __restrict__ all_inputs,
-    const unsigned int * __restrict__ indices,
-    float * __restrict__ all_outputs,
-    const int n,
-    const int k,
-    const int batch,
-    const int topk,
-    const int k_padded,
-    const int input_dim1) {
-    indexed_moe_forward<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
-}
+INDEXED_MOE_FWD(q2k_q8_1_nw1,  QK_K,  QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1, 1)
+INDEXED_MOE_FWD(q3k_q8_1_nw1,  QK_K,  QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1, 1)
+INDEXED_MOE_FWD(q4k_q8_1_nw1,  QK_K,  QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 1)
+INDEXED_MOE_FWD(q5k_q8_1_nw1,  QK_K,  QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1, 1)
+INDEXED_MOE_FWD(q6k_q8_1_nw1,  QK_K,  QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1, 1)
+INDEXED_MOE_FWD(q8_0_q8_1_nw1, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1, 1)
 
-extern "C" __global__ void indexed_moe_forward_q5k_q8_1(
-    const void * __restrict__ all_weights,
-    const void * __restrict__ all_inputs,
-    const unsigned int * __restrict__ indices,
-    float * __restrict__ all_outputs,
-    const int n,
-    const int k,
-    const int batch,
-    const int topk,
-    const int k_padded,
-    const int input_dim1) {
-    indexed_moe_forward<QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
-}
-
-extern "C" __global__ void indexed_moe_forward_q6k_q8_1(
-    const void * __restrict__ all_weights,
-    const void * __restrict__ all_inputs,
-    const unsigned int * __restrict__ indices,
-    float * __restrict__ all_outputs,
-    const int n,
-    const int k,
-    const int batch,
-    const int topk,
-    const int k_padded,
-    const int input_dim1) {
-    indexed_moe_forward<QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
-}
-
-extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
-    const void * __restrict__ all_weights,
-    const void * __restrict__ all_inputs,
-    const unsigned int * __restrict__ indices,
-    float * __restrict__ all_outputs,
-    const int n,
-    const int k,
-    const int batch,
-    const int topk,
-    const int k_padded,
-    const int input_dim1) {
-    indexed_moe_forward<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
-}
+#undef INDEXED_MOE_FWD

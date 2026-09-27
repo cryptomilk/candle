@@ -17,26 +17,85 @@ use crate::rocm_backend::rocm_rs::hip::Dim3;
 use crate::rocm_backend::{kernels, RocmStorage, RocmStorageSlice};
 use crate::{Layout, Result, Shape};
 
-/// `nwarps` the kernel is written for. It is a compile-time constant inside
-/// `indexed_moe_forward`, sizing the `tmp_shared[nwarps - 1][WARP_SIZE]`
-/// inter-warp reduction buffer, so `blockDim.y` has to be exactly this.
-const NWARPS: usize = 4;
-
-/// Kernel entry point for `dtype`, or `None` when there is none.
+/// `qi` (the MMVQ `QI*` constant) and `vdr` (`VDR_*_Q8_1_MMVQ`) for `dtype`,
+/// taken verbatim from `quantized.cu`. Together with `dtype.block_size()`
+/// (`qk`) these determine `blocks_per_iter = vdr * nwarps * WARP_SIZE / qi`,
+/// the per-iteration reduction width `indexed_moe_forward` divides `k` by.
 ///
-/// Note the casing: these spell the K-quants `q4k`, not `q4_K` as the MMVQ
-/// family does. Taken verbatim from `quantized.cu`.
-fn kernel_name(dtype: GgmlDType) -> Option<&'static str> {
-    let name = match dtype {
-        GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
-        GgmlDType::Q3K => "indexed_moe_forward_q3k_q8_1",
-        GgmlDType::Q4K => "indexed_moe_forward_q4k_q8_1",
-        GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
-        GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
-        GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
+/// Mirrors `quantized/cuda.rs::moe_qi_vdr`.
+fn qi_vdr(dtype: GgmlDType) -> Option<(usize, usize)> {
+    let pair = match dtype {
+        GgmlDType::Q2K => (16, 1),
+        GgmlDType::Q3K => (16, 1),
+        GgmlDType::Q4K => (32, 2),
+        GgmlDType::Q5K => (32, 2),
+        GgmlDType::Q6K => (32, 1),
+        GgmlDType::Q8_0 => (8, 2),
         _ => return None,
     };
-    Some(name)
+    Some(pair)
+}
+
+/// Kernel entry point and `nwarps` for `dtype` at reduction width `k`, or
+/// `None` when there is no kernel for `dtype`.
+///
+/// `nwarps` is a compile-time template parameter of `indexed_moe_forward`
+/// (it sizes the `tmp_shared[nwarps - 1][WARP_SIZE]` inter-warp reduction
+/// buffer), so `blockDim.y` has to match whichever entry point this returns.
+///
+/// The kernel's reduction loop walks `k / qk` blocks in strides of
+/// `blocks_per_iter = vdr * nwarps * WARP_SIZE / qi`. At `nwarps = 4` that
+/// stride can exceed the number of blocks `k` actually has. For example,
+/// `k = 768` against `Q4K` (`qk = 256`, `qi = 32`, `vdr = 2`) has 3 blocks
+/// per row but a stride of 8, so more than half the launched warps find
+/// `kbx >= blocks_per_row_x` on their very first (only) look and never do a
+/// single `vec_dot`. The fallback is `nwarps = 1`, the smallest the kernel
+/// supports. It keeps every warp's stride at `blocks_per_row_x` or below
+/// whenever 4 warps would have been overkill for `k`.
+///
+/// Note the casing: the kernel names spell the K-quants `q4k`, not `q4_K` as
+/// the MMVQ family does. Taken verbatim from `quantized.cu`.
+///
+/// Mirrors `quantized/cuda.rs::moe_kernel_for`.
+fn kernel_for(dtype: GgmlDType, k: usize) -> Option<(&'static str, usize)> {
+    let (name_nw4, name_nw1) = match dtype {
+        GgmlDType::Q2K => (
+            "indexed_moe_forward_q2k_q8_1",
+            "indexed_moe_forward_q2k_q8_1_nw1",
+        ),
+        GgmlDType::Q3K => (
+            "indexed_moe_forward_q3k_q8_1",
+            "indexed_moe_forward_q3k_q8_1_nw1",
+        ),
+        GgmlDType::Q4K => (
+            "indexed_moe_forward_q4k_q8_1",
+            "indexed_moe_forward_q4k_q8_1_nw1",
+        ),
+        GgmlDType::Q5K => (
+            "indexed_moe_forward_q5k_q8_1",
+            "indexed_moe_forward_q5k_q8_1_nw1",
+        ),
+        GgmlDType::Q6K => (
+            "indexed_moe_forward_q6k_q8_1",
+            "indexed_moe_forward_q6k_q8_1_nw1",
+        ),
+        GgmlDType::Q8_0 => (
+            "indexed_moe_forward_q8_0_q8_1",
+            "indexed_moe_forward_q8_0_q8_1_nw1",
+        ),
+        _ => return None,
+    };
+    let (qi, vdr) = qi_vdr(dtype)?;
+    let qk = dtype.block_size();
+    let blocks_per_row = k / qk;
+    // The largest nwarps (out of {1, 4}, the two instantiated tiers) whose
+    // `blocks_per_iter` does not exceed `blocks_per_row`.
+    let nwarps4_fits = vdr * 4 * WARP_SIZE / qi <= blocks_per_row;
+    if nwarps4_fits {
+        Some((name_nw4, 4))
+    } else {
+        Some((name_nw1, 1))
+    }
 }
 
 /// The shapes the kernel launch is derived from, once validated.
@@ -92,14 +151,6 @@ pub(super) fn forward(
     ids: &RocmStorage,
     ids_l: &Layout,
 ) -> Result<(RocmStorage, Shape)> {
-    let name = match kernel_name(q.dtype) {
-        Some(name) => name,
-        None => crate::bail!(
-            "indexed_moe_forward is not implemented for {:?} on ROCm; \
-             it needs one of q2k, q3k, q4k, q5k, q6k or q8_0",
-            q.dtype
-        ),
-    };
     let d = dims(self_shape, input_l, ids_l)?;
     if !d.k.is_multiple_of(q.dtype.block_size()) {
         crate::bail!(
@@ -142,6 +193,15 @@ pub(super) fn forward(
         ),
     };
 
+    let (name, nwarps) = match kernel_for(q.dtype, d.k) {
+        Some(plan) => plan,
+        None => crate::bail!(
+            "indexed_moe_forward is not implemented for {:?} on ROCm; \
+             it needs one of q2k, q3k, q4k, q5k, q6k or q8_0",
+            q.dtype
+        ),
+    };
+
     let dev = &q.device;
     let total_rows = d.batch * d.input_dim1;
     let k_padded = pad(d.k, MATRIX_ROW_PADDING);
@@ -180,7 +240,7 @@ pub(super) fn forward(
     // indexes `ids` with.
     func.launch(
         Dim3::new_3d(d.n as u32, d.batch as u32, d.topk as u32),
-        Dim3::new_2d(WARP_SIZE as u32, NWARPS as u32),
+        Dim3::new_2d(WARP_SIZE as u32, nwarps as u32),
         0,
         Some(dev.stream()),
         &mut args,
