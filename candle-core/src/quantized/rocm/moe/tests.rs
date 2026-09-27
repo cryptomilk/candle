@@ -138,11 +138,15 @@ fn indexed_moe_per_expert_input_matches_the_cpu_rocm() -> Result<()> {
 }
 
 /// `k` past one `MATRIX_ROW_PADDING` stride, so a wrong padded row stride in
-/// the `q8_1` activation buffer shows up rather than cancelling out.
+/// the `q8_1` activation buffer shows up rather than cancelling out. Also
+/// covers every MoE dtype's `nwarps = 1` fallback: `blocks_per_row = k / qk`
+/// is 3 for the K-quants, so `nwarps = 4`'s stride of 8 would leave more than
+/// half the launched warps with nothing to do. See `super::kernel_for` for
+/// the fallback logic.
 #[test]
 fn indexed_moe_unpadded_k_matches_the_cpu_rocm() -> Result<()> {
     let device = rocm_device!();
-    for dtype in [GgmlDType::Q4K, GgmlDType::Q8_0] {
+    for dtype in MOE_DTYPES {
         check(&device, dtype, 3, 64, 768, 2, 2, 1)?;
     }
     Ok(())
@@ -157,6 +161,20 @@ fn indexed_moe_single_token_matches_the_cpu_rocm() -> Result<()> {
     let device = rocm_device!();
     for dtype in MOE_DTYPES {
         check(&device, dtype, 8, 128, 256, 1, 1, 1)?;
+    }
+    Ok(())
+}
+
+/// `k = 2048` keeps `blocks_per_iter(nwarps=4)` at or below `blocks_per_row`
+/// for every MoE dtype, exercising the primary `nwarps = 4` kernel tier that
+/// production shapes (e.g. Qwen3-MoE's `k = 2048` down-proj) actually hit.
+/// Complements `indexed_moe_unpadded_k_matches_the_cpu_rocm` which covers
+/// the `nwarps = 1` fallback.
+#[test]
+fn indexed_moe_large_k_nwarps4_matches_the_cpu_rocm() -> Result<()> {
+    let device = rocm_device!();
+    for dtype in MOE_DTYPES {
+        check(&device, dtype, 4, 64, 2048, 2, 2, 1)?;
     }
     Ok(())
 }
