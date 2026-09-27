@@ -420,6 +420,52 @@ guard borrows the storage, which makes that a compile error. `QStorage` exposes
 it as `rocm_device_ptr_with_guard`, separate from the CUDA
 `device_ptr_with_guard`, whose guard is tied to a `CudaStream`.
 
+### Async host-to-device transfers
+
+`RocmDevice::with_pinned_host_memory` registers a host slice with
+`hipHostRegister`, hands the closure a borrowed `PinnedHostRegion`, and
+unregisters it again when the closure returns. `SendSyncDeviceMemory::copy_from_host_async`
+and `RocmDevice::clone_htod_async` accept that region as their source. Unlike
+the synchronous `copy_from_host`/`clone_htod`, the async versions enqueue a
+`hipMemcpyAsync` on the device's stream and return immediately, without
+draining first — the same stream-ordering `copy_from_device` already relies on.
+`quantized::rocm::load_quantized_async` is the quantized-load counterpart of
+`load_quantized`: it uploads pinned bytes and wraps the result into
+`QStorage::Rocm` in one call, deriving the logical length from `data` itself
+rather than taking it as a separate argument, so it cannot drift from what
+was actually uploaded the way a caller-supplied length could. Internally it
+calls a private `upload_async` (the `hipMemcpyAsync` counterpart of the
+private `upload`) — that split stays private because nothing needs the raw
+uploaded buffer for anything other than immediately wrapping it.
+
+Taking `&PinnedHostRegion<'_, T>` rather than a plain slice makes the
+page-locked-memory requirement a type-level fact instead of an unenforced doc
+comment. `PinnedHostRegion::drop` drains the owning stream before calling
+`hipHostUnregister`, so an early drop can't unregister memory the DMA engine
+is still reading — the caller doesn't have to track completion by hand. That
+guarantee depends on `Drop` actually running, which safe code can skip
+(`std::mem::forget` and friends). `PinnedHostRegion::new` is therefore
+`pub(crate)`, and `with_pinned_host_memory` is the only way to obtain one. It
+hands the closure a borrow, never an owned value, so there's nothing for safe
+code to leak and the drain-then-unregister is unconditional. The drain also
+blocks on *all* work queued on the device's single stream, not just this
+region's copies, so getting any overlap out of the async path means doing the
+other host-side work you want to overlap with the transfer inside the
+closure, before it returns. Dropping right after one `copy_from_host_async`
+is strictly slower than the synchronous path. Separately, that guarantee also
+depends on the copy actually running on the stream the region was pinned on,
+so `copy_from_host_async` checks the two streams for identity (`Arc::ptr_eq`)
+and rejects a mismatch with `hipErrorInvalidValue`. A region pinned on one
+device can't be used to copy into a buffer owned by another.
+
+This has no `cuda_backend` counterpart to mirror; it is new API surface, not a
+divergence. `QRocmStorage`'s fields are private, so `load_quantized_async`
+living in this file (rather than `QRocmStorage` exposing a public
+constructor) is what lets an external crate build one at all. Crane's MoE
+prefill path (`SparseMoeBlock::gpu_offload_forward`) is the first consumer,
+pinning its two packed expert tensors once per forward call and uploading
+both without waiting for either to finish before dispatching compute.
+
 ### Mixture-of-experts
 
 `QRocmStorage::indexed_moe_forward` launches

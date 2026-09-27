@@ -370,7 +370,7 @@ impl<T> SendSyncDeviceMemory<T> {
         if self.ptr.is_null() || data.is_empty() {
             return Ok(());
         }
-        let bytes = self.size.min(std::mem::size_of_val(data));
+        let bytes = self.transfer_bytes(std::mem::size_of_val(data));
         self.synchronize()?;
         // SAFETY: both pointers are valid for `bytes`, which is clamped to the
         // smaller of the two.
@@ -384,6 +384,46 @@ impl<T> SendSyncDeviceMemory<T> {
         })
     }
 
+    /// Stream-ordered host-to-device copy from pinned host memory.
+    ///
+    /// Unlike [`Self::copy_from_host`] this does not drain the stream first:
+    /// the copy is enqueued behind whatever is already queued on the owning
+    /// device's stream, the same ordering [`Self::copy_from_device`] relies
+    /// on for its D2D copy. Returns as soon as the copy is enqueued. The
+    /// transfer may still be in flight when this call returns.
+    ///
+    /// Taking [`PinnedHostRegion`] rather than a plain slice makes the
+    /// page-locked-memory requirement a type-level fact instead of a doc
+    /// comment, and `PinnedHostRegion::drop`'s stream sync guarantees `src`
+    /// outlives the enqueued transfer even if the caller drops it early —
+    /// so, unlike the first version of this method, this one needs no
+    /// `unsafe`. That guarantee only holds if the copy runs on the same
+    /// stream `src` was pinned on and will drain on drop, so `src` must have
+    /// been pinned by the same device this buffer was allocated on; a
+    /// mismatch is rejected with `hipErrorInvalidValue` rather than trusting
+    /// the caller to get it right.
+    pub fn copy_from_host_async(&mut self, src: &PinnedHostRegion<'_, T>) -> Result<(), HipError> {
+        if self.ptr.is_null() || src.size == 0 {
+            return Ok(());
+        }
+        if !Arc::ptr_eq(&self.alloc.stream, &src.stream) {
+            return hip_check(bindings::hipError_t_hipErrorInvalidValue);
+        }
+        let bytes = self.transfer_bytes(src.size);
+        // SAFETY: both pointers are valid for `bytes`; `src` is pinned and,
+        // via its stream-synchronising `Drop`, is guaranteed to outlive the
+        // enqueued transfer.
+        hip_check(unsafe {
+            bindings::hipMemcpyAsync(
+                self.ptr,
+                src.ptr,
+                bytes,
+                bindings::hipMemcpyKind_hipMemcpyHostToDevice,
+                self.alloc.raw_stream(),
+            )
+        })
+    }
+
     /// Device-to-host copy, clamped to the shorter of the two buffers.
     ///
     /// Same shape as [`Self::copy_from_host`]: drain, then copy. The drain is
@@ -392,7 +432,7 @@ impl<T> SendSyncDeviceMemory<T> {
         if self.ptr.is_null() || data.is_empty() {
             return Ok(());
         }
-        let bytes = self.size.min(std::mem::size_of_val(data));
+        let bytes = self.transfer_bytes(std::mem::size_of_val(data));
         self.synchronize()?;
         // SAFETY: as above.
         hip_check(unsafe {
@@ -414,7 +454,7 @@ impl<T> SendSyncDeviceMemory<T> {
         if self.ptr.is_null() || src.ptr.is_null() {
             return Ok(());
         }
-        let bytes = self.size.min(src.size);
+        let bytes = self.transfer_bytes(src.size);
         // SAFETY: both pointers are valid for `bytes`.
         hip_check(unsafe {
             bindings::hipMemcpyAsync(
@@ -442,6 +482,11 @@ impl<T> SendSyncDeviceMemory<T> {
         // SAFETY: the allocator keeps this stream alive.
         hip_check(unsafe { bindings::hipStreamSynchronize(self.alloc.raw_stream()) })
     }
+
+    /// Clamp a transfer to the shorter of this allocation and `other_bytes`.
+    fn transfer_bytes(&self, other_bytes: usize) -> usize {
+        self.size.min(other_bytes)
+    }
 }
 
 impl<T> Drop for SendSyncDeviceMemory<T> {
@@ -450,6 +495,135 @@ impl<T> Drop for SendSyncDeviceMemory<T> {
         self.ptr = std::ptr::null_mut();
     }
 }
+
+/// A region of existing host memory pinned via `hipHostRegister`, so
+/// [`SendSyncDeviceMemory::copy_from_host_async`] can DMA it without the
+/// driver staging through its own pinned buffer first.
+///
+/// Unpinned on drop via `hipHostUnregister`, after draining the owning
+/// device's stream: any `copy_from_host_async` enqueued against this region
+/// is ordered on that stream, so the drain is what guarantees the transfer
+/// has actually finished before the memory is unregistered (and, once the
+/// caller's borrow ends, potentially freed or reused) — not just that the
+/// call to enqueue it returned. `copy_from_host_async` rejects a region
+/// pinned on a different device's stream than the destination buffer's, so
+/// this guarantee can't be defeated by copying to one device with a region
+/// pinned on another. The borrowed lifetime `'a` keeps the caller from
+/// freeing or reallocating the underlying slice while it is registered; it
+/// does not stop the memory from being unmapped through some other handle to
+/// the same address range, for instance an `mmap`'d file closed via a raw
+/// fd. Avoiding that stays the caller's responsibility.
+///
+/// # Soundness caveat
+///
+/// The guarantee above holds only if `Drop` actually runs. Rust does not
+/// guarantee that. `std::mem::forget` (or an `Rc`/`Arc` cycle, or
+/// `Box::leak`) is safe code and skips it, which would let the borrowed
+/// memory be freed while a `copy_from_host_async` against it is still in
+/// flight. `new` is therefore `pub(crate)`: the only way to obtain a region
+/// is [`super::RocmDevice::with_pinned_host_memory`], which hands out a
+/// borrowed `&PinnedHostRegion` rather than an owned one, so there is no
+/// value for safe code to leak and the drain is structurally unconditional.
+///
+/// # Performance caveat
+///
+/// The stream drain in `Drop` blocks on *all* work queued on the owning
+/// device's stream, not only copies issued against this region. This
+/// backend uses one stream per device. Dropping (or scope-exiting) right
+/// after a single `copy_from_host_async` therefore gives no overlap over the
+/// synchronous path and is strictly slower, since it also pays
+/// `hipHostRegister`/`hipHostUnregister`. The transfer only overlaps
+/// meaningfully with other host-side work issued before the region is
+/// dropped.
+pub struct PinnedHostRegion<'a, T> {
+    ptr: *const std::ffi::c_void,
+    size: usize,
+    stream: Arc<SendSyncStream>,
+    _marker: PhantomData<&'a [T]>,
+}
+
+impl<'a, T> PinnedHostRegion<'a, T> {
+    /// Pin `data` for async DMA transfers on `stream`'s device.
+    ///
+    /// Registering an already-registered range is not undefined behaviour —
+    /// `hipHostRegister` reports it as the ordinary, `hip_check`-surfaced
+    /// error `hipErrorHostMemoryAlreadyRegistered` — so it isn't listed
+    /// below as a safety precondition.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for reads for `size_of_val(data)` bytes for the
+    /// lifetime `'a`.
+    pub(crate) unsafe fn new(data: &'a [T], stream: Arc<SendSyncStream>) -> Result<Self, HipError> {
+        let size = std::mem::size_of_val(data);
+        let ptr = data.as_ptr() as *const std::ffi::c_void;
+        if size == 0 {
+            return Ok(Self {
+                ptr,
+                size: 0,
+                stream,
+                _marker: PhantomData,
+            });
+        }
+        hip_check(bindings::hipHostRegister(
+            ptr as *mut std::ffi::c_void,
+            size,
+            bindings::hipHostRegisterDefault,
+        ))?;
+        Ok(Self {
+            ptr,
+            size,
+            stream,
+            _marker: PhantomData,
+        })
+    }
+
+    /// The pinned host pointer, suitable as a `hipMemcpyAsync` source.
+    pub fn as_ptr(&self) -> *const std::ffi::c_void {
+        self.ptr
+    }
+
+    /// Byte size of the pinned region.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Number of elements the pinned region holds.
+    pub fn len(&self) -> usize {
+        self.size / std::mem::size_of::<T>()
+    }
+
+    /// Whether the pinned region holds no elements.
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+}
+
+impl<T> Drop for PinnedHostRegion<'_, T> {
+    fn drop(&mut self) {
+        if self.size > 0 {
+            // Drain the stream so any `copy_from_host_async` reading this
+            // region has actually finished before it is unregistered.
+            // Errors are swallowed: `Drop` can't propagate them, and a
+            // failed sync means the device is already in an error state
+            // that unregistering can't make worse.
+            let _ = unsafe { bindings::hipStreamSynchronize(self.stream.0.as_raw()) };
+            // SAFETY: `self.ptr` was successfully registered in `new`, and
+            // this is the only place that unregisters it.
+            unsafe {
+                let _ = bindings::hipHostUnregister(self.ptr as *mut std::ffi::c_void);
+            }
+        }
+    }
+}
+
+// SAFETY: the registration is a process-wide driver state keyed by address,
+// not thread-affine; the borrow in `_marker` is what actually guards the
+// memory, and `T: Sync` is required so sharing that borrow across threads is
+// itself sound.
+unsafe impl<T: Sync> Send for PinnedHostRegion<'_, T> {}
+// SAFETY: every method is read-only.
+unsafe impl<T: Sync> Sync for PinnedHostRegion<'_, T> {}
 
 #[cfg(test)]
 mod tests {

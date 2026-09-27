@@ -3,7 +3,7 @@
 //! Split from that module's own unit tests, which cover the pure bucket
 //! arithmetic and need no device.
 
-use super::RocmDevice;
+use super::{RocmDevice, WrapErr};
 use crate::Result;
 
 /// Returns early when the machine has no ROCm GPU, like the other ROCm test
@@ -115,4 +115,55 @@ fn growing_allocations_do_not_hoard_unboundedly() -> Result<()> {
     assert!(dev.allocator.cached_bytes() <= 64 << 20);
     dev.allocator.set_cache_limit(usize::MAX);
     Ok(())
+}
+
+/// An async copy from pinned host memory must land the same bytes as the
+/// synchronous path, once the caller synchronises before reading back.
+#[test]
+fn async_copy_from_pinned_host_matches_sync() -> Result<()> {
+    let dev = device!();
+    let data: Vec<f32> = (0..1024).map(|i| i as f32).collect();
+    let dst = dev.with_pinned_host_memory(&data, |pin| {
+        let mut dst = dev.alloc::<f32>(data.len())?;
+        dst.copy_from_host_async(pin).w()?;
+        Ok(dst)
+    })?;
+    // `with_pinned_host_memory` drains the stream before unregistering, so
+    // the copy is guaranteed complete by the time it returns. No explicit
+    // synchronise is needed here.
+
+    let readback = dev.clone_dtoh(&dst)?;
+    assert_eq!(readback, data);
+    Ok(())
+}
+
+/// Pinning and unpinning a zero-length slice must not crash.
+#[test]
+fn pinning_an_empty_slice_is_a_no_op() -> Result<()> {
+    let dev = device!();
+    let empty: &[u8] = &[];
+    dev.with_pinned_host_memory(empty, |pin| {
+        assert_eq!(pin.size(), 0);
+        Ok(())
+    })
+}
+
+/// A region pinned on one device's stream must not be usable to copy into a
+/// buffer allocated on another: `PinnedHostRegion::drop` only drains the
+/// stream it was pinned on, so accepting the mismatch would let the source
+/// memory be unregistered while a copy enqueued on the *other* stream is
+/// still in flight.
+#[test]
+fn async_copy_rejects_a_region_pinned_on_another_stream() -> Result<()> {
+    let a = device!();
+    let b = match RocmDevice::new_with_stream(0) {
+        Ok(dev) => dev,
+        Err(_) => return Ok(()),
+    };
+    let data: Vec<f32> = (0..64).map(|i| i as f32).collect();
+    a.with_pinned_host_memory(&data, |pin| {
+        let mut dst = b.alloc::<f32>(data.len())?;
+        assert!(dst.copy_from_host_async(pin).is_err());
+        Ok(())
+    })
 }

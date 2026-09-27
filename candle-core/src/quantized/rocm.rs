@@ -29,7 +29,7 @@ use super::{GgmlDType, QStorage};
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::quantized::k_quants::GgmlType;
 use crate::rocm_backend::{
-    rocm_error, RocmDevice, RocmStorage, RocmStorageSlice, SendSyncDeviceMemory,
+    rocm_error, PinnedHostRegion, RocmDevice, RocmStorage, RocmStorageSlice, SendSyncDeviceMemory,
 };
 use crate::{CpuStorage, DType, Layout, Result, Shape};
 
@@ -90,6 +90,44 @@ fn upload(device: &RocmDevice, data: &[u8], dtype: GgmlDType) -> Result<SendSync
         .copy_from_host(data)
         .map_err(|e| rocm_error(format!("failed to upload quantized data: {e}")))?;
     Ok(inner)
+}
+
+/// Upload `data` from pinned host memory into a freshly allocated,
+/// zero-padded device buffer, without blocking.
+///
+/// The async counterpart of [`upload`]. `alloc_zeros`' memset and the copy
+/// are both ordered on the same device stream, so the copy still lands after
+/// the padding is zeroed with no host synchronisation in between.
+fn upload_async(
+    device: &RocmDevice,
+    data: &PinnedHostRegion<'_, u8>,
+    dtype: GgmlDType,
+) -> Result<SendSyncDeviceMemory<u8>> {
+    let mut inner = device.alloc_zeros::<u8>(padded_len(data.len(), dtype))?;
+    // `copy_from_host_async` clamps to the shorter of the two, so the
+    // padding stays zeroed.
+    inner
+        .copy_from_host_async(data)
+        .map_err(|e| rocm_error(format!("failed async upload of quantized data: {e}")))?;
+    Ok(inner)
+}
+
+/// Async counterpart of [`load_quantized`]: uploads `data` (already pinned
+/// by the caller) with `hipMemcpyAsync` and wraps the result into quantized
+/// storage. The logical length is computed from `data` itself, the same way
+/// [`load_quantized`] derives it from the slice it just uploaded, so it
+/// cannot drift from what was actually uploaded.
+pub fn load_quantized_async(
+    device: &RocmDevice,
+    data: &PinnedHostRegion<'_, u8>,
+    dtype: GgmlDType,
+) -> Result<QStorage> {
+    Ok(QStorage::Rocm(QRocmStorage {
+        data: upload_async(device, data, dtype)?,
+        len: data.len(),
+        dtype,
+        device: device.clone(),
+    }))
 }
 
 /// Dequantize `n` blocks of `buffer` on the CPU.

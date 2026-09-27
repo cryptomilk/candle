@@ -2,7 +2,7 @@ use crate::Result;
 use candle_rocm_kernels::KernelCache;
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::alloc::{RocmAllocator, SendSyncDeviceMemory};
+use super::alloc::{PinnedHostRegion, RocmAllocator, SendSyncDeviceMemory};
 #[cfg(feature = "miopen")]
 use super::wrappers::SendSyncMIOpenHandle;
 use super::wrappers::{RocmBlas, SendSyncPseudoRng, SendSyncRocblasHandle, SendSyncStream};
@@ -229,6 +229,63 @@ impl RocmDevice {
             .map_err(|e| rocm_error(format!("Failed to allocate ROCm memory: {}", e)))?;
         dst.copy_from_host(src)
             .map_err(|e| rocm_error(format!("Failed to copy host to device: {}", e)))?;
+        Ok(dst)
+    }
+
+    /// Pin `data` for the duration of `f`, then drain the stream and unpin.
+    ///
+    /// `f` only ever sees a borrowed `&PinnedHostRegion`, never an owned one, so
+    /// there is no value for the caller to leak. The drain-then-unregister
+    /// in `PinnedHostRegion`'s `Drop` runs unconditionally when `f` returns,
+    /// including if `f` returns an error or panics, which is what makes
+    /// this a safe fn.
+    ///
+    /// # Stream drain cost
+    ///
+    /// The drain after `f` returns blocks on *all* work queued on this
+    /// device's stream, not only the copies issued against this region.
+    /// This backend uses a single stream per device (see this module's top
+    /// doc comment). Returning from `f` immediately after a single
+    /// `copy_from_host_async` therefore gives no overlap over the
+    /// synchronous `clone_htod` and is strictly slower, since it also pays
+    /// `hipHostRegister`/`hipHostUnregister`. To see any benefit, issue the
+    /// other host-side work you want to overlap with the transfer, such as
+    /// further copies or kernel launches, inside `f` before it returns.
+    pub fn with_pinned_host_memory<'a, T, R>(
+        &self,
+        data: &'a [T],
+        f: impl FnOnce(&PinnedHostRegion<'a, T>) -> Result<R>,
+    ) -> Result<R> {
+        self.bind()?;
+        // SAFETY: `data` outlives the region (borrowed for `'a`). The
+        // region never escapes `f`; it is dropped, unconditionally, right
+        // below.
+        let region = unsafe { PinnedHostRegion::new(data, self.stream.clone()) }
+            .map_err(|e| rocm_error(format!("Failed to pin host memory: {}", e)))?;
+        let result = f(&region);
+        drop(region);
+        result
+    }
+
+    /// Allocate and enqueue an async host-to-device copy.
+    ///
+    /// The [`Self::clone_htod`] counterpart for pinned host memory: returns
+    /// as soon as the copy is enqueued, so the transfer may still be in
+    /// flight when this call returns. `src` may safely be dropped as soon as
+    /// this returns — [`PinnedHostRegion`]'s `Drop` drains the stream before
+    /// unregistering, so it can't race the enqueued copy. `src` must have
+    /// been pinned by `self` (see [`Self::with_pinned_host_memory`]); a
+    /// region pinned on a different device is rejected (see
+    /// [`SendSyncDeviceMemory::copy_from_host_async`]).
+    pub fn clone_htod_async<T: Clone>(
+        &self,
+        src: &PinnedHostRegion<'_, T>,
+    ) -> Result<SendSyncDeviceMemory<T>> {
+        self.bind()?;
+        let mut dst = SendSyncDeviceMemory::new(&self.allocator, src.len())
+            .map_err(|e| rocm_error(format!("Failed to allocate ROCm memory: {}", e)))?;
+        dst.copy_from_host_async(src)
+            .map_err(|e| rocm_error(format!("Failed async host-to-device copy: {}", e)))?;
         Ok(dst)
     }
 
