@@ -370,7 +370,7 @@ impl<T> SendSyncDeviceMemory<T> {
         if self.ptr.is_null() || data.is_empty() {
             return Ok(());
         }
-        let bytes = self.size.min(std::mem::size_of_val(data));
+        let bytes = self.transfer_bytes(std::mem::size_of_val(data));
         self.synchronize()?;
         // SAFETY: both pointers are valid for `bytes`, which is clamped to the
         // smaller of the two.
@@ -384,6 +384,49 @@ impl<T> SendSyncDeviceMemory<T> {
         })
     }
 
+    /// Stream-ordered host-to-device copy from an owned pinned host buffer.
+    ///
+    /// Unlike [`Self::copy_from_host`] this does not drain the stream first:
+    /// the copy is enqueued behind whatever is already queued on the owning
+    /// device's stream, the same ordering [`Self::copy_from_device`] relies
+    /// on for its D2D copy. Returns as soon as the copy is enqueued. The
+    /// transfer may still be in flight when this call returns.
+    ///
+    /// Taking [`PinnedBuffer`] rather than a plain slice makes the
+    /// page-locked-memory requirement a type-level fact instead of a doc
+    /// comment. `src` owns its allocation, so unlike the borrowed
+    /// `PinnedHostRegion` this replaced, there is no lifetime for `Drop` to
+    /// protect by draining the stream — the caller must keep `src` alive (or
+    /// synchronize) for as long as the transfer may still be in flight,
+    /// same as reusing any other async-copy source. `src` must have been
+    /// allocated on the same device this buffer was allocated on; a mismatch
+    /// is rejected with `hipErrorInvalidValue` rather than trusting the
+    /// caller to get it right.
+    pub fn copy_from_pinned_async(&mut self, src: &PinnedBuffer<T>) -> Result<(), HipError>
+    where
+        T: Copy + Send + Sync,
+    {
+        if self.ptr.is_null() || src.size() == 0 {
+            return Ok(());
+        }
+        if !Arc::ptr_eq(&self.alloc.stream, &src.stream) {
+            return hip_check(bindings::hipError_t_hipErrorInvalidValue);
+        }
+        let bytes = self.transfer_bytes(src.size());
+        // SAFETY: both pointers are valid for `bytes`; `src` owns its
+        // allocation and the caller is responsible for keeping it alive
+        // until the transfer completes.
+        hip_check(unsafe {
+            bindings::hipMemcpyAsync(
+                self.ptr,
+                src.ptr,
+                bytes,
+                bindings::hipMemcpyKind_hipMemcpyHostToDevice,
+                self.alloc.raw_stream(),
+            )
+        })
+    }
+
     /// Device-to-host copy, clamped to the shorter of the two buffers.
     ///
     /// Same shape as [`Self::copy_from_host`]: drain, then copy. The drain is
@@ -392,7 +435,7 @@ impl<T> SendSyncDeviceMemory<T> {
         if self.ptr.is_null() || data.is_empty() {
             return Ok(());
         }
-        let bytes = self.size.min(std::mem::size_of_val(data));
+        let bytes = self.transfer_bytes(std::mem::size_of_val(data));
         self.synchronize()?;
         // SAFETY: as above.
         hip_check(unsafe {
@@ -414,7 +457,7 @@ impl<T> SendSyncDeviceMemory<T> {
         if self.ptr.is_null() || src.ptr.is_null() {
             return Ok(());
         }
-        let bytes = self.size.min(src.size);
+        let bytes = self.transfer_bytes(src.size);
         // SAFETY: both pointers are valid for `bytes`.
         hip_check(unsafe {
             bindings::hipMemcpyAsync(
@@ -442,6 +485,11 @@ impl<T> SendSyncDeviceMemory<T> {
         // SAFETY: the allocator keeps this stream alive.
         hip_check(unsafe { bindings::hipStreamSynchronize(self.alloc.raw_stream()) })
     }
+
+    /// Clamp a transfer to the shorter of this allocation and `other_bytes`.
+    fn transfer_bytes(&self, other_bytes: usize) -> usize {
+        self.size.min(other_bytes)
+    }
 }
 
 impl<T> Drop for SendSyncDeviceMemory<T> {
@@ -450,6 +498,143 @@ impl<T> Drop for SendSyncDeviceMemory<T> {
         self.ptr = std::ptr::null_mut();
     }
 }
+
+/// Owned pinned (page-locked) host memory, allocated via `hipHostMalloc` and
+/// released via `hipHostFree`, so [`SendSyncDeviceMemory::copy_from_pinned_async`]
+/// can DMA it without the driver staging through its own pinned buffer
+/// first.
+///
+/// Unlike the borrowed `PinnedHostRegion` this replaced, `PinnedBuffer` owns
+/// its allocation: there is no caller data whose lifetime `Drop` needs to
+/// protect, only this buffer's own memory, which `hipHostFree` releases
+/// unconditionally. `std::mem::forget` on a value of this type merely leaks
+/// the allocation, the same way forgetting any other owned buffer would —
+/// not a use-after-free, since nothing borrowed it. That is what lets `new`
+/// be reachable through a `pub` constructor ([`super::RocmDevice::new_pinned_buffer`])
+/// and the value held in a struct field across many sequential uploads,
+/// amortising the `hipHostMalloc` cost instead of paying a fresh
+/// `hipHostRegister`/`hipHostUnregister` pair every time.
+///
+/// # Reuse caveat
+///
+/// `Drop` does not drain the stream before freeing — there is no borrowed
+/// memory whose lifetime the drain protects, only this buffer's own
+/// allocation. A caller that overwrites the buffer's contents for a second
+/// upload (e.g. via [`Self::as_mut_slice`]) is responsible for synchronizing
+/// first, same as reusing any other async-copy source.
+pub struct PinnedBuffer<T: Copy + Send + Sync> {
+    ptr: *mut std::ffi::c_void,
+    len: usize,
+    stream: Arc<SendSyncStream>,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Copy + Send + Sync> PinnedBuffer<T> {
+    /// Allocate `len` pinned elements of `T` via `hipHostMalloc`, owned by
+    /// `stream`'s device for [`SendSyncDeviceMemory::copy_from_pinned_async`]'s
+    /// stream-identity check.
+    pub(crate) fn new(len: usize, stream: Arc<SendSyncStream>) -> Result<Self, HipError> {
+        let size = len * std::mem::size_of::<T>();
+        if size == 0 {
+            return Ok(Self {
+                ptr: std::ptr::null_mut(),
+                len,
+                stream,
+                _marker: PhantomData,
+            });
+        }
+        let mut ptr = std::ptr::null_mut();
+        hip_check(unsafe {
+            bindings::hipHostMalloc(&mut ptr, size, bindings::hipHostMallocDefault)
+        })?;
+        Ok(Self {
+            ptr,
+            len,
+            stream,
+            _marker: PhantomData,
+        })
+    }
+
+    /// The pinned host pointer, suitable as a `hipMemcpyAsync` source.
+    pub fn as_ptr(&self) -> *const std::ffi::c_void {
+        self.ptr
+    }
+
+    /// Byte size of the pinned buffer.
+    pub fn size(&self) -> usize {
+        self.len * std::mem::size_of::<T>()
+    }
+
+    /// Number of elements the pinned buffer holds.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the pinned buffer holds no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The pinned buffer's contents as a host slice.
+    pub fn as_slice(&self) -> &[T] {
+        if self.ptr.is_null() {
+            return &[];
+        }
+        // SAFETY: `self.ptr` is valid for `self.len` elements of `T` for the
+        // lifetime of `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.len) }
+    }
+
+    /// The pinned buffer's contents as a mutable host slice.
+    ///
+    /// Overwriting a buffer whose previous contents are still being read by
+    /// an in-flight `copy_from_pinned_async` is the caller's responsibility
+    /// to avoid — synchronize first if reusing this buffer for a new upload.
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        if self.ptr.is_null() {
+            return &mut [];
+        }
+        // SAFETY: `self.ptr` is valid for `self.len` elements of `T` for the
+        // lifetime of `self`, and `self` is borrowed mutably here.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.len) }
+    }
+}
+
+impl<T: Copy + Send + Sync> Drop for PinnedBuffer<T> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: `self.ptr` was successfully allocated in `new`, and
+            // this is the only place that frees it. No stream drain: there
+            // is no borrowed caller memory to protect, see the type's doc
+            // comment's "Reuse caveat".
+            unsafe {
+                let _ = bindings::hipHostFree(self.ptr);
+            }
+        }
+    }
+}
+
+// SAFETY: the allocation is a process-wide driver mapping keyed by address,
+// not thread-affine; `PinnedBuffer` owns it exclusively, with no borrowed
+// data whose sharing needs protecting the way `PinnedHostRegion` needed.
+// Unlike `SendSyncDeviceMemory<T>`, `T` is *not* a phantom tag here:
+// `as_slice`/`as_mut_slice` materialize live `&[T]`/`&mut [T]` over this
+// memory, so a `T` that crosses a thread boundary through this type (by
+// moving the buffer, or by sharing `&PinnedBuffer<T>`) must itself be sound
+// to send/share — hence the `T: Send + Sync` bound. `T: Copy` additionally
+// rules out types with drop glue, which would be unsound to abandon when
+// `hipHostFree` releases the backing memory without running `T::drop`, and
+// rules out niched/non-exhaustive bit patterns being read back before the
+// first write. (A `T` that is `Copy + Send + Sync` but still has invalid bit
+// patterns, e.g. `NonZeroU32`, is not caught by this bound — but nothing in
+// this codebase instantiates `PinnedBuffer` with such a type, and callers
+// always write through `as_mut_slice` before any read.)
+unsafe impl<T: Copy + Send + Sync> Send for PinnedBuffer<T> {}
+// SAFETY: see the `Send` impl above for the `T` bound. `as_slice`/`len`/
+// `size`/`is_empty`/`as_ptr` are read-only; the only mutating method,
+// `as_mut_slice`, requires `&mut self` and so cannot be called concurrently
+// from shared references.
+unsafe impl<T: Copy + Send + Sync> Sync for PinnedBuffer<T> {}
 
 #[cfg(test)]
 mod tests {
