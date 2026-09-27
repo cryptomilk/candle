@@ -3,9 +3,9 @@
 
 #include <hip/hip_bf16.h>
 
-// The only spelling difference between the two bfloat16 APIs. Everything the
-// kernels use (__float2bfloat16, __bfloat162float, __hmax, __hmin, arithmetic
-// operators) already matches.
+// Most of the bfloat16 API already matches between CUDA and HIP: the kernels'
+// use of __float2bfloat16, __bfloat162float, __hmax, __hmin and arithmetic
+// operators needs no bridging beyond this type alias.
 typedef __hip_bfloat16 __nv_bfloat16;
 typedef __hip_bfloat162 __nv_bfloat162;
 
@@ -19,4 +19,11 @@ __device__ __forceinline__ __nv_bfloat16 __hmax_nan(__nv_bfloat16 a, __nv_bfloat
 
 __device__ __forceinline__ __nv_bfloat16 __hmin_nan(__nv_bfloat16 a, __nv_bfloat16 b) {
     return __hisnan(a) ? a : (__hisnan(b) ? b : __hmin(a, b));
+}
+
+// CUDA's scalar float-to-bfloat16 conversion is spelled with a `_rn`
+// (round-to-nearest) suffix; HIP's is not, and does not define the suffixed
+// name at all. Both round to nearest, so this is a pure spelling alias.
+__device__ __forceinline__ __nv_bfloat16 __float2bfloat16_rn(float f) {
+    return __float2bfloat16(f);
 }

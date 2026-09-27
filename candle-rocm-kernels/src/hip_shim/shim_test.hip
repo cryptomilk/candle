@@ -15,6 +15,26 @@ __global__ void shfl_sum(const float *in, float *out) {
     if (threadIdx.x % 32 == 0) out[threadIdx.x / 32] = v;
 }
 
+// --- same reduction, omitting width: candle's CUDA call sites rely on the
+// default (warpSize on CUDA); the macro must default it to 32 instead ------
+__global__ void shfl_sum_no_width(const float *in, float *out) {
+    float v = in[threadIdx.x];
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        v += __shfl_xor_sync(0xffffffff, v, mask);
+    }
+    if (threadIdx.x % 32 == 0) {
+        out[threadIdx.x / 32] = v;
+    }
+}
+
+// --- __shfl_sync, omitting width: moe_wmma_gguf.cu's Q8_0 dequant broadcasts
+// lane 0's value this way -- 3-arg __shfl_sync must also default to 32 -------
+__global__ void shfl_broadcast_no_width(const float *in, float *out) {
+    float v = in[threadIdx.x];
+    v = __shfl_sync(0xffffffff, v, 0);
+    out[threadIdx.x] = v;
+}
+
 // --- __syncwarp: HIP's own definition must not be shadowed -----------------
 // The shim deliberately does not define __syncwarp. A `#define __syncwarp()`
 // would replace HIP's fenced version with a scheduling-only barrier *and* make
@@ -58,6 +78,13 @@ __global__ void atomic_add_bf16(__hip_bfloat16 *acc) {
     atomicAdd(acc, __float2bfloat16(1.0f));
 }
 
+// --- __float2bfloat16_rn: CUDA's round-to-nearest spelling of the same
+// conversion __float2bfloat16 already performs ------------------------------
+__global__ void bf16_roundtrip_rn(float in, float *out) {
+    __hip_bfloat16 h = __float2bfloat16_rn(in);
+    *out = __bfloat162float(h);
+}
+
 // Unaligned case: accumulator at an odd 16-bit slot, to exercise the
 // upper-half branch of the CAS loop.
 __global__ void atomic_add_half_pair(__half *accs) {
@@ -84,10 +111,11 @@ int main() {
     int failures = 0;
     const int N = 128; // 4 waves of 32
 
-    float h_in[N], *d_in, *d_out;
+    float h_in[N], *d_in, *d_out, *d_out2;
     for (int i = 0; i < N; ++i) h_in[i] = (float)(i + 1);
     HIP_CHECK(hipMalloc(&d_in, N * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_out, 4 * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_out2, N * sizeof(float)));
     HIP_CHECK(hipMemcpy(d_in, h_in, N * sizeof(float), hipMemcpyHostToDevice));
     hipLaunchKernelGGL(shfl_sum, dim3(1), dim3(N), 0, 0, d_in, d_out);
     float h_out[4];
@@ -101,6 +129,29 @@ int main() {
         snprintf(name, sizeof(name), "shfl_xor_sync group %d", g);
         CHECK(fabsf(h_out[g] - want) < 1e-3f, name);
     }
+
+    hipLaunchKernelGGL(shfl_sum_no_width, dim3(1), dim3(N), 0, 0, d_in, d_out);
+    HIP_CHECK(hipMemcpy(h_out, d_out, 4 * sizeof(float), hipMemcpyDeviceToHost));
+    for (int g = 0; g < 4; ++g) {
+        float want = 0;
+        for (int i = g * 32; i < (g + 1) * 32; ++i) want += h_in[i];
+        char name[64];
+        snprintf(name, sizeof(name), "shfl_xor_sync (no width) group %d", g);
+        CHECK(fabsf(h_out[g] - want) < 1e-3f, name);
+    }
+
+    // Broadcasting lane 0's value to the rest of its group of 32.
+    hipLaunchKernelGGL(shfl_broadcast_no_width, dim3(1), dim3(N), 0, 0, d_in, d_out2);
+    float h_out2[N];
+    HIP_CHECK(hipMemcpy(h_out2, d_out2, N * sizeof(float), hipMemcpyDeviceToHost));
+    int broadcast_ok = 1;
+    for (int g = 0; g < 4; ++g) {
+        float want = h_in[g * 32];
+        for (int i = g * 32; i < (g + 1) * 32; ++i) {
+            broadcast_ok &= (fabsf(h_out2[i] - want) < 1e-3f);
+        }
+    }
+    CHECK(broadcast_ok, "shfl_sync (no width) broadcast");
 
     // One wave exchanging through shared memory across both __syncwarp forms.
     int *d_sw;
@@ -164,6 +215,14 @@ int main() {
     __hip_bfloat16 h_b;
     HIP_CHECK(hipMemcpy(&h_b, d_b, sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
     CHECK(fabsf(__bfloat162float(h_b) - 128.0f) < 0.5f, "atomicAdd(__hip_bfloat16*)");
+
+    // 42.0 is exactly representable in bf16, so the roundtrip is exact.
+    float *d_rn;
+    HIP_CHECK(hipMalloc(&d_rn, sizeof(float)));
+    hipLaunchKernelGGL(bf16_roundtrip_rn, dim3(1), dim3(1), 0, 0, 42.0f, d_rn);
+    float h_rn;
+    HIP_CHECK(hipMemcpy(&h_rn, d_rn, sizeof(float), hipMemcpyDeviceToHost));
+    CHECK(fabsf(h_rn - 42.0f) < 1e-3f, "__float2bfloat16_rn roundtrip");
 
     printf("\n%d failure(s)\n", failures);
     return failures != 0;

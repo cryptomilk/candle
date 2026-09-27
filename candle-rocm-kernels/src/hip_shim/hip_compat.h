@@ -122,13 +122,34 @@ __device__ __forceinline__ unsigned int __vsubss4(unsigned int a, unsigned int b
 // only ever pass a full mask, and HIP's unsuffixed __shfl_xor already has
 // whole-wavefront semantics, so drop the mask.
 //
-// Every candle call site passes an explicit width of 32 (WARP_SIZE), which HIP
-// honours as a sub-wavefront shuffle. That keeps the block-reduction indexing
-// correct on both wave32 (RDNA) and wave64 (CDNA) hardware.
-#define __shfl_xor_sync(mask, var, lane_mask, width) __shfl_xor(var, lane_mask, width)
-#define __shfl_sync(mask, var, src_lane, width) __shfl(var, src_lane, width)
-#define __shfl_up_sync(mask, var, delta, width) __shfl_up(var, delta, width)
-#define __shfl_down_sync(mask, var, delta, width) __shfl_down(var, delta, width)
+// CUDA's *_sync intrinsics take an optional trailing width (defaulting to
+// warpSize, always 32 on CUDA); most candle call sites pass an explicit width
+// of 32 (WARP_SIZE), but some rely on the default. HIP's warpSize is 64 on
+// CDNA, so a dropped width can't forward to HIP's own warpSize -- these macros
+// are variadic and default the omitted width to the literal 32 instead, to
+// keep the block-reduction indexing correct on both wave32 (RDNA) and wave64
+// (CDNA) hardware.
+//
+// CANDLE_SHFL_SEL4_ picks the 3-arg or 4-arg variant by counting arguments; it
+// only balances parentheses, so a macro argument with a bare top-level comma
+// (e.g. a template call written as foo<A,B>(x)) would be mis-split. No current
+// call site does that.
+#define CANDLE_SHFL_SEL4_(_1, _2, _3, _4, FN, ...) FN
+#define CANDLE_SHFL_XOR_3_(mask, var, lane_mask) __shfl_xor(var, lane_mask, 32)
+#define CANDLE_SHFL_XOR_4_(mask, var, lane_mask, width) __shfl_xor(var, lane_mask, width)
+#define __shfl_xor_sync(...) CANDLE_SHFL_SEL4_(__VA_ARGS__, CANDLE_SHFL_XOR_4_, CANDLE_SHFL_XOR_3_)(__VA_ARGS__)
+
+#define CANDLE_SHFL_3_(mask, var, src_lane) __shfl(var, src_lane, 32)
+#define CANDLE_SHFL_4_(mask, var, src_lane, width) __shfl(var, src_lane, width)
+#define __shfl_sync(...) CANDLE_SHFL_SEL4_(__VA_ARGS__, CANDLE_SHFL_4_, CANDLE_SHFL_3_)(__VA_ARGS__)
+
+#define CANDLE_SHFL_UP_3_(mask, var, delta) __shfl_up(var, delta, 32)
+#define CANDLE_SHFL_UP_4_(mask, var, delta, width) __shfl_up(var, delta, width)
+#define __shfl_up_sync(...) CANDLE_SHFL_SEL4_(__VA_ARGS__, CANDLE_SHFL_UP_4_, CANDLE_SHFL_UP_3_)(__VA_ARGS__)
+
+#define CANDLE_SHFL_DOWN_3_(mask, var, delta) __shfl_down(var, delta, 32)
+#define CANDLE_SHFL_DOWN_4_(mask, var, delta, width) __shfl_down(var, delta, width)
+#define __shfl_down_sync(...) CANDLE_SHFL_SEL4_(__VA_ARGS__, CANDLE_SHFL_DOWN_4_, CANDLE_SHFL_DOWN_3_)(__VA_ARGS__)
 
 // __syncwarp gets the same treatment, for the same reason. HIP does define it
 // (amd_warp_sync_functions.h) and its unmasked form is the one to use: it
