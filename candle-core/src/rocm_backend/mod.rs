@@ -68,7 +68,7 @@ mod tests_sort;
 #[cfg(test)]
 mod tests_transpose;
 mod wrappers;
-pub use alloc::SendSyncDeviceMemory;
+pub use alloc::{PinnedBuffer, SendSyncDeviceMemory};
 pub use device::{DeviceId, RocmDevice};
 pub use error::{RocmError, WrapErr};
 pub use gemm_precision::{

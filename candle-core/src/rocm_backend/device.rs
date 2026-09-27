@@ -2,7 +2,7 @@ use crate::Result;
 use candle_rocm_kernels::KernelCache;
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::alloc::{RocmAllocator, SendSyncDeviceMemory};
+use super::alloc::{PinnedBuffer, RocmAllocator, SendSyncDeviceMemory};
 #[cfg(feature = "miopen")]
 use super::wrappers::SendSyncMIOpenHandle;
 use super::wrappers::{RocmBlas, SendSyncPseudoRng, SendSyncRocblasHandle, SendSyncStream};
@@ -230,6 +230,20 @@ impl RocmDevice {
         dst.copy_from_host(src)
             .map_err(|e| rocm_error(format!("Failed to copy host to device: {}", e)))?;
         Ok(dst)
+    }
+
+    /// Allocate `len` pinned elements of `T`, owned by `self`'s stream.
+    ///
+    /// The returned [`PinnedBuffer`] is a `pub` value, not scoped to a
+    /// closure: unlike the borrowed `PinnedHostRegion` API this replaces,
+    /// `PinnedBuffer` owns its allocation, so it can be held in a struct
+    /// field and reused across many [`SendSyncDeviceMemory::copy_from_pinned_async`]
+    /// calls, paying `hipHostMalloc` once instead of a fresh
+    /// `hipHostRegister`/`hipHostUnregister` pair per upload.
+    pub fn new_pinned_buffer<T: Copy + Send + Sync>(&self, len: usize) -> Result<PinnedBuffer<T>> {
+        self.bind()?;
+        PinnedBuffer::new(len, self.stream.clone())
+            .map_err(|e| rocm_error(format!("Failed to allocate pinned host memory: {}", e)))
     }
 
     pub fn clone_dtoh<T: Default + Clone>(&self, src: &SendSyncDeviceMemory<T>) -> Result<Vec<T>> {

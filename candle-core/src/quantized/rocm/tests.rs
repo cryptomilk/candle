@@ -76,6 +76,39 @@ fn load_quantized_round_trips_the_payload() -> Result<()> {
     Ok(())
 }
 
+/// `load_quantized_async` must upload the same bytes as the synchronous
+/// `load_quantized`, so the two paths can't silently drift apart.
+#[test]
+fn load_quantized_async_matches_sync() -> Result<()> {
+    let dev = rocm_device!();
+    let xs: Vec<f32> = (0..1024).map(|i| i as f32 / 128.).collect();
+    let mut blocks = vec![BlockQ4_0::zeros(); xs.len() / 32];
+    BlockQ4_0::from_float(&xs, &mut blocks);
+    let raw: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            blocks.as_ptr() as *const u8,
+            std::mem::size_of_val(blocks.as_slice()),
+        )
+    };
+
+    let sync_storage = load_quantized(&dev, &blocks)?;
+    let sync_bytes = match &sync_storage {
+        QStorage::Rocm(s) => s.data()?,
+        _ => crate::bail!("load_quantized did not produce a rocm storage"),
+    };
+
+    let mut pin = dev.new_pinned_buffer::<u8>(raw.len())?;
+    pin.as_mut_slice().copy_from_slice(raw);
+    let async_storage = load_quantized_async(&dev, &pin, GgmlDType::Q4_0)?;
+    let async_bytes = match &async_storage {
+        QStorage::Rocm(s) => s.data()?,
+        _ => crate::bail!("load_quantized_async did not produce a rocm storage"),
+    };
+
+    assert_eq!(async_bytes, sync_bytes);
+    Ok(())
+}
+
 /// The device dequantize kernels have to agree with the reference CPU
 /// implementation for every dtype that has one.
 #[test]

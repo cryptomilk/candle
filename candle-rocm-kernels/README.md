@@ -420,6 +420,54 @@ guard borrows the storage, which makes that a compile error. `QStorage` exposes
 it as `rocm_device_ptr_with_guard`, separate from the CUDA
 `device_ptr_with_guard`, whose guard is tied to a `CudaStream`.
 
+### Async host-to-device transfers
+
+`RocmDevice::new_pinned_buffer` allocates an owned `PinnedBuffer<T>` via
+`hipHostMalloc`, scoped to the device's stream.
+`SendSyncDeviceMemory::copy_from_pinned_async` accepts a `PinnedBuffer` as its
+source. Unlike the synchronous `copy_from_host`/`clone_htod`, the async
+version enqueues a `hipMemcpyAsync` on the device's stream and returns
+immediately, without draining first — the same stream-ordering
+`copy_from_device` already relies on. `quantized::rocm::load_quantized_async`
+is the quantized-load counterpart of `load_quantized`: it uploads pinned
+bytes and wraps the result into `QStorage::Rocm` in one call, deriving the
+logical length from `data` itself rather than taking it as a separate
+argument, so it cannot drift from what was actually uploaded the way a
+caller-supplied length could. Internally it calls a private `upload_async`
+(the `hipMemcpyAsync` counterpart of the private `upload`) — that split stays
+private because nothing needs the raw uploaded buffer for anything other than
+immediately wrapping it.
+
+Taking `&PinnedBuffer<T>` rather than a plain slice makes the page-locked-memory
+requirement a type-level fact instead of an unenforced doc comment.
+`PinnedBuffer` owns its allocation (`hipHostMalloc`/`hipHostFree`) rather than
+pinning a borrowed caller slice (`hipHostRegister`/`hipHostUnregister`), so
+there is no borrowed data whose lifetime a `Drop`-time stream drain would need
+to protect: `Drop` just calls `hipHostFree` on the buffer's own memory.
+`std::mem::forget` on a `PinnedBuffer` merely leaks that allocation, the same
+as forgetting any other owned buffer — not a use-after-free, since nothing
+borrowed it. That is what lets `RocmDevice::new_pinned_buffer` hand back an
+owned value directly instead of running a closure: a `PinnedBuffer` can be
+held in a struct field and reused across many sequential uploads, amortizing
+the `hipHostMalloc` cost instead of paying a fresh
+`hipHostRegister`/`hipHostUnregister` pair every call. The tradeoff is that
+reuse is the caller's responsibility: overwriting a buffer's contents (via
+`PinnedBuffer::as_mut_slice`) while a previous `copy_from_pinned_async`
+against it may still be in flight requires synchronizing first, the same
+requirement as reusing any other async-copy source.
+`copy_from_pinned_async` still checks the source and destination streams for
+identity (`Arc::ptr_eq`) and rejects a mismatch with `hipErrorInvalidValue` —
+a buffer allocated on one device can't be used to copy into a buffer owned by
+another.
+
+This has no `cuda_backend` counterpart to mirror; it is new API surface, not a
+divergence. `QRocmStorage`'s fields are private, so `load_quantized_async`
+living in this file (rather than `QRocmStorage` exposing a public
+constructor) is what lets an external crate build one at all. Crane's MoE
+prefill path (`SparseMoeBlock::gpu_offload_forward`) is the first consumer,
+pinning its two packed expert tensors once per forward call and uploading
+both without waiting for either to finish before dispatching compute.
+
 ### Mixture-of-experts
 
 `QRocmStorage::indexed_moe_forward` launches

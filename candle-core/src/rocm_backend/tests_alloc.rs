@@ -3,7 +3,7 @@
 //! Split from that module's own unit tests, which cover the pure bucket
 //! arithmetic and need no device.
 
-use super::RocmDevice;
+use super::{RocmDevice, WrapErr};
 use crate::Result;
 
 /// Returns early when the machine has no ROCm GPU, like the other ROCm test
@@ -114,5 +114,64 @@ fn growing_allocations_do_not_hoard_unboundedly() -> Result<()> {
     }
     assert!(dev.allocator.cached_bytes() <= 64 << 20);
     dev.allocator.set_cache_limit(usize::MAX);
+    Ok(())
+}
+
+/// An async copy from a pinned host buffer must land the same bytes as the
+/// synchronous path, once the caller synchronises before reading back.
+#[test]
+fn async_copy_from_pinned_buffer_matches_sync() -> Result<()> {
+    let dev = device!();
+    let data: Vec<f32> = (0..1024).map(|i| i as f32).collect();
+    let mut pin = dev.new_pinned_buffer::<f32>(data.len())?;
+    pin.as_mut_slice().copy_from_slice(&data);
+
+    let mut dst = dev.alloc::<f32>(data.len())?;
+    dst.copy_from_pinned_async(&pin).w()?;
+    dev.synchronize()?;
+
+    let readback = dev.clone_dtoh(&dst)?;
+    assert_eq!(readback, data);
+    Ok(())
+}
+
+/// A buffer pinned on one device's stream must not be usable to copy into a
+/// buffer allocated on another: there is no cross-stream ordering guarantee
+/// between the two devices, so accepting the mismatch would let the copy
+/// race whatever the destination device's stream does next.
+#[test]
+fn async_copy_rejects_pinned_buffer_on_another_stream() -> Result<()> {
+    let a = device!();
+    let b = match RocmDevice::new_with_stream(0) {
+        Ok(dev) => dev,
+        Err(_) => return Ok(()),
+    };
+    let data: Vec<f32> = (0..64).map(|i| i as f32).collect();
+    let mut pin = a.new_pinned_buffer::<f32>(data.len())?;
+    pin.as_mut_slice().copy_from_slice(&data);
+
+    let mut dst = b.alloc::<f32>(data.len())?;
+    assert!(dst.copy_from_pinned_async(&pin).is_err());
+    Ok(())
+}
+
+/// Synchronising before dropping a `PinnedBuffer` used in an async copy must
+/// produce the correct data: this is the documented-safe usage pattern
+/// (`copy_from_pinned_async`'s caller must keep the source alive, or
+/// synchronize, for as long as the transfer may still be in flight).
+#[test]
+fn sync_then_drop_pinned_buffer_is_safe() -> Result<()> {
+    let dev = device!();
+    let data: Vec<f32> = (0..1024).map(|i| i as f32).collect();
+    let mut pin = dev.new_pinned_buffer::<f32>(data.len())?;
+    pin.as_mut_slice().copy_from_slice(&data);
+
+    let mut dst = dev.alloc::<f32>(data.len())?;
+    dst.copy_from_pinned_async(&pin).w()?;
+    dev.synchronize()?;
+    drop(pin);
+
+    let readback = dev.clone_dtoh(&dst)?;
+    assert_eq!(readback, data);
     Ok(())
 }
