@@ -489,6 +489,16 @@ parameter. The two agree for every K-quant instantiation, but `q8_0` passes
 `QK8_0` = 32, so its expert stride was an eighth of the expert matrix and every
 routed pair past expert 0 read the wrong weights.
 
+A second bug in the same kernel: its reduction loop strides over `k` in steps
+of `blocks_per_iter = vdr * nwarps * WARP_SIZE / qi`, but `nwarps` was a
+hard-coded `4` regardless of `k`. For small `k` (e.g. `k = 768` against a
+K-quant, where `blocks_per_row` is only 3), `blocks_per_iter` exceeds
+`blocks_per_row`, so more than half the launched warps find nothing to do on
+their very first look and never run a single `vec_dot`. `nwarps` is now a
+template parameter with a second `nwarps = 1` instantiation per dtype; the
+host picks whichever keeps `blocks_per_iter` at or below `blocks_per_row` for
+the call's actual `k`.
+
 ### Not implemented
 
 These are the things CUDA does and this backend does not. Kept separate from the
