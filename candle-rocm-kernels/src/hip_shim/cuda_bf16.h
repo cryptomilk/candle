@@ -27,3 +27,15 @@ __device__ __forceinline__ __nv_bfloat16 __hmin_nan(__nv_bfloat16 a, __nv_bfloat
 __device__ __forceinline__ __nv_bfloat16 __float2bfloat16_rn(float f) {
     return __float2bfloat16(f);
 }
+
+// CUDA packs two floats into a bfloat162 with __floats2bfloat162_rn; HIP
+// defines the fp16 equivalent (__floats2half2_rn) but not this one. A
+// constrained template coexists with a future non-template overload of the
+// same name — see hip_compat.h's atomicAdd shim for the rationale — so this
+// stops being instantiated, rather than erroring as a redefinition, the day
+// ROCm adds its own.
+template <typename T, typename candle_hip::enable_if<
+                          candle_hip::is_same<T, float>::value, int>::type = 0>
+__device__ __forceinline__ __nv_bfloat162 __floats2bfloat162_rn(T a, T b) {
+    return __nv_bfloat162{__float2bfloat16(a), __float2bfloat16(b)};
+}
