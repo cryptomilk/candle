@@ -56,20 +56,45 @@ impl Map1Any for FastReduce<'_> {
         }
 
         let el_to_sum_per_block = src_el / dst_el;
+
+        // `fast_sum`'s warp-shuffle reduction divides by WARP_SIZE (32) to find
+        // how many warps' partial sums to merge; with fewer than 32 threads in
+        // the block that division truncates to zero, so every thread's partial
+        // sum gets discarded and the kernel writes zero instead of the real
+        // total. Route small sums (e.g. MoE's combine step, which sums over
+        // `top_k` experts) to `fast_sum_small`, a plain one-thread-per-output
+        // loop with no warp-size assumption. Mirrors
+        // `cuda_backend::mod::FastReduce::f`'s `use_small_reduce`.
+        let use_small_reduce = el_to_sum_per_block <= 32 && !return_index && name == "fast_sum";
+
         // The reduction loop needs the shared array fully initialized, which
         // requires the thread count to be a power of two.
         let block_dim = usize::min(1024, el_to_sum_per_block).next_power_of_two();
 
-        let func_name = try_kernel_name::<T>(name)?;
+        let (func_name, grid, block, kernel_numel) = if use_small_reduce {
+            let threads = 256usize;
+            let blocks = dst_el.div_ceil(threads);
+            (
+                try_kernel_name::<T>("fast_sum_small")?,
+                rocm_rs::hip::Dim3::from(blocks as u32),
+                rocm_rs::hip::Dim3::from(threads as u32),
+                dst_el,
+            )
+        } else {
+            (
+                try_kernel_name::<T>(name)?,
+                // `fast_*` maps one block to one output element, so the grid is
+                // sized by the output rather than through `launch_config`.
+                // `hipModuleLaunchKernel` rejects a zero grid, and `dst_el` is
+                // known non-zero by this point.
+                rocm_rs::hip::Dim3::from(dst_el as u32),
+                rocm_rs::hip::Dim3::from(block_dim as u32),
+                src_el,
+            )
+        };
 
         let ds_data: Vec<usize> = [dims.as_slice(), stride.as_slice()].concat();
         let ds = dev.clone_htod(&ds_data)?;
-
-        // `fast_*` maps one block to one output element, so the grid is sized by
-        // the output rather than through `launch_config`. `hipModuleLaunchKernel`
-        // rejects a zero grid, and `dst_el` is known non-zero by this point.
-        let grid = rocm_rs::hip::Dim3::from(dst_el as u32);
-        let block = rocm_rs::hip::Dim3::from(block_dim as u32);
 
         let launch = |out_ptr: *mut std::ffi::c_void| -> Result<()> {
             unsafe {
@@ -82,7 +107,7 @@ impl Map1Any for FastReduce<'_> {
                     grid,
                     block,
                     &mut [
-                        &src_el as *const usize as *mut std::ffi::c_void,
+                        &kernel_numel as *const usize as *mut std::ffi::c_void,
                         &el_to_sum_per_block as *const usize as *mut std::ffi::c_void,
                         &src_dims.len() as *const usize as *mut std::ffi::c_void,
                         (&ds_ptr) as *const *const usize as *mut std::ffi::c_void,
