@@ -282,7 +282,8 @@ test_device!(
     broadcast_matmul_stride_zero_lhs,
     broadcast_matmul_stride_zero_lhs_cpu,
     broadcast_matmul_stride_zero_lhs_gpu,
-    broadcast_matmul_stride_zero_lhs_metal
+    broadcast_matmul_stride_zero_lhs_metal,
+    broadcast_matmul_stride_zero_lhs_rocm
 );
 test_device!(
     zero_matmul,

@@ -675,5 +675,6 @@ test_device!(
     index_select_strided_ids_grad,
     index_select_strided_ids_grad_cpu,
     index_select_strided_ids_grad_gpu,
-    index_select_strided_ids_grad_metal
+    index_select_strided_ids_grad_metal,
+    index_select_strided_ids_grad_rocm
 );
