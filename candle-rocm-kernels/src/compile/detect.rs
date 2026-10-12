@@ -60,15 +60,19 @@ pub enum MmqTiles {
 /// The `RDNA*` define that selects `arch`'s MMQ geometry, or `None` where the
 /// kernel's default (Ampere) set stands.
 ///
-/// gfx12xx (RDNA4) takes the RDNA3 define: `quantized.cu` maps RDNA3 onto the
-/// RDNA2 tiles, which is the geometry RDNA4 wants as well, and adding a fourth
-/// spelling would select nothing new. gfx101x (RDNA1) is deliberately absent —
-/// its tile set is a third variant, and no candle CI or developer machine has
-/// the hardware to check it.
+/// gfx12xx (RDNA4) gets its own `RDNA4` define rather than reusing `RDNA3`.
+/// `quantized.cu`'s dp4a tile geometry is identical under both (see
+/// [`mmq_tiles`]), but the WMMA kernels in `candle-kernels/src/mmq_gguf`
+/// branch on `RDNA3` vs `RDNA4` for the matrix-core intrinsic and the input
+/// data layout (`I_MAJOR_MIRRORED` vs `I_MAJOR`). Collapsing them here would
+/// make RDNA4 silently compile RDNA3's WMMA path. gfx101x (RDNA1) is
+/// deliberately absent. Its tile set is a third variant, and no candle CI or
+/// developer machine has the hardware to check it.
 pub(crate) fn rdna_define(arch: &str) -> Option<&'static str> {
     match arch_number(arch)? {
         1030..=1039 => Some("RDNA2"),
-        1100..=1299 => Some("RDNA3"),
+        1100..=1199 => Some("RDNA3"),
+        1200..=1299 => Some("RDNA4"),
         _ => None,
     }
 }
@@ -79,6 +83,12 @@ pub(crate) fn mmq_tiles(arch: &str) -> MmqTiles {
         Some(_) => MmqTiles::Rdna2,
         None => MmqTiles::Ampere,
     }
+}
+
+/// Whether `arch` has AMD WMMA (matrix-core) support for the `mmq_gguf`
+/// kernels. True for RDNA3 (gfx11xx) and RDNA4 (gfx12xx).
+pub(crate) fn has_wmma(arch: &str) -> bool {
+    matches!(rdna_define(arch), Some("RDNA3" | "RDNA4"))
 }
 
 /// The numeric part of a `gfx` target, e.g. `gfx1101:xnack-` -> 1101.
@@ -166,14 +176,14 @@ fn short_version(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mmq_tiles, rdna_define, short_version, MmqTiles};
+    use super::{has_wmma, mmq_tiles, rdna_define, short_version, MmqTiles};
 
     #[test]
     fn selects_the_rdna_mmq_geometry_per_architecture() {
         assert_eq!(rdna_define("gfx1101"), Some("RDNA3"));
         assert_eq!(rdna_define("gfx1101:xnack-"), Some("RDNA3"));
         assert_eq!(rdna_define("gfx1151"), Some("RDNA3"));
-        assert_eq!(rdna_define("gfx1201"), Some("RDNA3"));
+        assert_eq!(rdna_define("gfx1201"), Some("RDNA4"));
         assert_eq!(rdna_define("gfx1030"), Some("RDNA2"));
         // RDNA1 and the CDNA/Vega parts keep the kernel's default set. `gfx90a`
         // must not be read as architecture 90.
@@ -186,8 +196,18 @@ mod tests {
     #[test]
     fn the_tile_set_follows_the_define() {
         assert_eq!(mmq_tiles("gfx1101"), MmqTiles::Rdna2);
+        assert_eq!(mmq_tiles("gfx1201"), MmqTiles::Rdna2);
         assert_eq!(mmq_tiles("gfx1030"), MmqTiles::Rdna2);
         assert_eq!(mmq_tiles("gfx90a"), MmqTiles::Ampere);
+    }
+
+    #[test]
+    fn wmma_is_rdna3_and_rdna4_only() {
+        assert!(has_wmma("gfx1101"));
+        assert!(has_wmma("gfx1201"));
+        assert!(!has_wmma("gfx1030"));
+        assert!(!has_wmma("gfx90a"));
+        assert!(!has_wmma("gfx942"));
     }
 
     #[test]

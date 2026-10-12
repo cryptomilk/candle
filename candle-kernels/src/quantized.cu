@@ -98,13 +98,16 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 // their set through `MMQ_ARCH` so the choice lives here rather than ten times
 // over, and so a set that is not selected costs nothing.
 //
-// Only candle-rocm-kernels ever defines RDNA2/RDNA3, and only for an RDNA
-// target; nvcc is given neither, so a CUDA build resolves to AMPERE — the set
-// the launchers used unconditionally before — and is unchanged. RDNA3 reuses
-// the RDNA2 tiles, as upstream llama.cpp does. The RDNA1 sets below stay
-// unreferenced: no candle build targets gfx101x, and their geometry is a third
-// variant nobody here can test.
-#if defined(RDNA2) || defined(RDNA3)
+// Only candle-rocm-kernels ever defines RDNA2/RDNA3/RDNA4, and only for an
+// RDNA target. nvcc is given none of them, so a CUDA build resolves to
+// AMPERE, the set the launchers used unconditionally before, and is
+// unchanged. RDNA3 and RDNA4 both reuse the RDNA2 tiles, as upstream
+// llama.cpp does for its own dp4a path. This file carries no WMMA kernel of
+// its own, so the RDNA3/RDNA4 split that matters for matrix cores
+// (`candle-kernels/src/mmq_gguf`) makes no difference here. The RDNA1 sets
+// below stay unreferenced: no candle build targets gfx101x, and their
+// geometry is a third variant nobody here can test.
+#if defined(RDNA2) || defined(RDNA3) || defined(RDNA4)
 #define MMQ_ARCH RDNA2
 #else
 #define MMQ_ARCH AMPERE
@@ -121,7 +124,7 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 // spills the accumulators to scratch: 1748 bytes per lane for `mul_mat_q3_K` on
 // gfx1101. Expands to nothing off RDNA, so nvcc sees the declarations it always
 // saw.
-#if defined(RDNA2) || defined(RDNA3)
+#if defined(RDNA2) || defined(RDNA3) || defined(RDNA4)
 #define MMQ_LAUNCH_BOUNDS(dtype) __launch_bounds__(WARP_SIZE*NWARPS_OF(dtype), 2)
 #else
 #define MMQ_LAUNCH_BOUNDS(dtype)
