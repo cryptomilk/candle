@@ -38,9 +38,11 @@ mod device_ptr;
 mod dmmv;
 mod kernels;
 mod mmq;
+mod mmq_wmma;
 mod mmvq;
 mod moe;
 mod q8_1;
+mod q8_1_mmq;
 mod quantize;
 
 pub use device_ptr::QRocmPtrGuard;
@@ -60,6 +62,8 @@ mod tests_device_ptr;
 mod tests_imatrix;
 #[cfg(test)]
 mod tests_mmq;
+#[cfg(test)]
+mod tests_mmq_wmma;
 #[cfg(test)]
 mod tests_mmvq;
 
@@ -354,6 +358,13 @@ impl QRocmStorage {
         // at a prefill-sized batch of f16 the dense path is about twice as
         // fast, and `dense::preferred` hands those to it instead.
         if !dense::preferred(storage.dtype(), self.dtype, n, k, b_size) {
+            // RDNA3/RDNA4 WMMA matrix cores beat `__dp4a` outright where both
+            // are available (Q4_K/Q6_K only for now; see `mmq_wmma::unit`),
+            // so it is tried first and `mmq` is the fallback for every other
+            // dtype and architecture.
+            if let Some(dst) = mmq_wmma::try_fwd(self, n, k, b_size, storage, layout)? {
+                return Ok(wrap(dst));
+            }
             if let Some(dst) = mmq::try_fwd(self, n, k, b_size, storage, layout)? {
                 return Ok(wrap(dst));
             }

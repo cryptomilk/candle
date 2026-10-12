@@ -91,12 +91,62 @@ pub(crate) fn has_wmma(arch: &str) -> bool {
     matches!(rdna_define(arch), Some("RDNA3" | "RDNA4"))
 }
 
-/// The numeric part of a `gfx` target, e.g. `gfx1101:xnack-` -> 1101.
+/// The AMD `cc` value `mmq_gguf`'s host-side functions expect
+/// (`amd_wmma_available`, `get_mmq_y_host`, `get_mmq_x_max_host`,
+/// `mmq_get_granularity_host` in `mmq_common.cuh`/`mmq_gguf.cuh`), or `None`
+/// if `arch` cannot be parsed this way.
 ///
-/// `None` for anything that is not purely numeric: `gfx90a` must not read as
-/// "90" and land in a range it was never meant to match.
+/// This is deliberately not [`arch_number`]'s plain decimal parse.
+/// `mmq_common.cuh` defines e.g. `GGML_CUDA_CC_RDNA4` as
+/// `GGML_CUDA_CC_OFFSET_AMD + 0x1200`, and the comparisons against it
+/// (`GGML_CUDA_CC_IS_RDNA4`) only land correctly if the `cc` value this
+/// function returns uses the same encoding: the last two characters of the
+/// stripped `gfxNNNN` name parsed as a *hex* minor version, the remainder
+/// parsed as a *hex* major version, combined as
+/// `OFFSET_AMD + major * 0x100 + minor`. This mirrors upstream llama.cpp's
+/// own `ggml_cuda_parse_id` (`ggml-cuda.cu`) bit for bit; a decimal parse of
+/// "1201" would give a smaller number than `GGML_CUDA_CC_RDNA4` and make
+/// `amd_wmma_available` wrongly report `false` for this card's gfx1201.
+pub(crate) fn amd_cc(arch: &str) -> Option<i32> {
+    const OFFSET_AMD: i32 = 0x0100_0000;
+    let name = arch.split(':').next()?.strip_prefix("gfx")?;
+    if name.len() < 3 {
+        return None;
+    }
+    if let Some(generic) = name.strip_suffix("-generic") {
+        let mut parts = generic.splitn(2, '-');
+        let major = i32::from_str_radix(parts.next()?, 16).ok()?;
+        let minor = match parts.next() {
+            Some(m) => i32::from_str_radix(m, 16).ok()? * 0x10,
+            None => 0,
+        };
+        return Some(OFFSET_AMD + major * 0x100 + minor);
+    }
+    let (major_str, minor_str) = name.split_at(name.len() - 2);
+    let minor = i32::from_str_radix(minor_str, 16).ok()?;
+    let major = i32::from_str_radix(major_str, 16).ok()?;
+    Some(OFFSET_AMD + major * 0x100 + minor)
+}
+
+/// The numeric part of a `gfx` target, e.g. `gfx1101:xnack-` -> 1101, or a
+/// ROCm generic target name synthesized into the same decimal scheme, e.g.
+/// `gfx12-generic` -> 1200.
+///
+/// `None` for anything that is neither: `gfx90a` must not read as "90" and
+/// land in a range it was never meant to match.
 fn arch_number(arch: &str) -> Option<u32> {
-    arch.split(':').next()?.strip_prefix("gfx")?.parse().ok()
+    let name = arch.split(':').next()?.strip_prefix("gfx")?;
+    if let Ok(n) = name.parse::<u32>() {
+        return Some(n);
+    }
+    let generic = name.strip_suffix("-generic")?;
+    let mut parts = generic.splitn(2, '-');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = match parts.next() {
+        Some(m) => m.parse().ok()?,
+        None => 0,
+    };
+    Some(major * 100 + minor * 10)
 }
 
 fn gcn_arch_name(ordinal: usize) -> Result<String, KernelError> {
@@ -176,7 +226,35 @@ fn short_version(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_wmma, mmq_tiles, rdna_define, short_version, MmqTiles};
+    use super::{amd_cc, has_wmma, mmq_tiles, rdna_define, short_version, MmqTiles};
+
+    /// `GGML_CUDA_CC_OFFSET_AMD` from `mmq_common.cuh`, so these tests can
+    /// check `amd_cc` against the real constants it has to agree with
+    /// rather than hand-picked numbers.
+    const OFFSET_AMD: i32 = 0x0100_0000;
+
+    #[test]
+    fn amd_cc_matches_the_ggml_cuda_cc_constants() {
+        // GGML_CUDA_CC_RDNA2 = OFFSET_AMD + 0x1030
+        assert_eq!(amd_cc("gfx1030"), Some(OFFSET_AMD + 0x1030));
+        // GGML_CUDA_CC_RDNA3 = OFFSET_AMD + 0x1100
+        assert_eq!(amd_cc("gfx1100"), Some(OFFSET_AMD + 0x1100));
+        assert_eq!(amd_cc("gfx1101"), Some(OFFSET_AMD + 0x1101));
+        // GGML_CUDA_CC_RDNA4 = OFFSET_AMD + 0x1200; gfx1201's encoding must
+        // land >= this, which a decimal parse of "1201" would not.
+        let rdna4 = OFFSET_AMD + 0x1200;
+        assert!(amd_cc("gfx1201").unwrap() >= rdna4);
+        assert_eq!(amd_cc("gfx1201"), Some(OFFSET_AMD + 0x1201));
+        // A target feature suffix must not change the encoding.
+        assert_eq!(amd_cc("gfx1101:xnack-"), Some(OFFSET_AMD + 0x1101));
+    }
+
+    #[test]
+    fn amd_cc_rejects_short_or_empty_names() {
+        assert_eq!(amd_cc("gfx10"), None);
+        assert_eq!(amd_cc("gfx"), None);
+        assert_eq!(amd_cc("not-a-gfx-target"), None);
+    }
 
     #[test]
     fn selects_the_rdna_mmq_geometry_per_architecture() {
@@ -208,6 +286,30 @@ mod tests {
         assert!(!has_wmma("gfx1030"));
         assert!(!has_wmma("gfx90a"));
         assert!(!has_wmma("gfx942"));
+    }
+
+    #[test]
+    fn arch_number_handles_generic_targets() {
+        assert_eq!(rdna_define("gfx12-generic"), Some("RDNA4"));
+        assert_eq!(rdna_define("gfx11-generic"), Some("RDNA3"));
+        assert_eq!(rdna_define("gfx10-3-generic"), Some("RDNA2"));
+        // gfx9-generic -> 900, outside every RDNA range.
+        assert_eq!(rdna_define("gfx9-generic"), None);
+    }
+
+    #[test]
+    fn has_wmma_accepts_generic_targets() {
+        assert!(has_wmma("gfx12-generic"));
+        assert!(has_wmma("gfx11-generic"));
+        assert!(!has_wmma("gfx10-3-generic"));
+        assert!(!has_wmma("gfx9-generic"));
+    }
+
+    #[test]
+    fn amd_cc_handles_generic_targets() {
+        assert_eq!(amd_cc("gfx12-generic"), Some(OFFSET_AMD + 0x1200));
+        assert_eq!(amd_cc("gfx11-generic"), Some(OFFSET_AMD + 0x1100));
+        assert_eq!(amd_cc("gfx10-3-generic"), Some(OFFSET_AMD + 0x1030));
     }
 
     #[test]

@@ -37,6 +37,9 @@ pub struct RocmDevice {
     kernel_manager: Arc<KernelCache>,
     /// Compute units, read once at init and used to size elementwise grids.
     multiprocessor_count: u32,
+    /// Maximum opt-in dynamic shared memory per block, read once at init;
+    /// see `quantized::rocm::mmq_wmma`'s tile-size search.
+    shared_mem_per_block_optin: i64,
     /// Device copies of `[dims, strides…]` vectors; see
     /// [`super::params_from_vec`].
     param_cache: Arc<super::ParamCache>,
@@ -98,6 +101,7 @@ impl RocmDevice {
         Ok(Self {
             id: DeviceId::new(),
             multiprocessor_count: multiprocessor_count(device_id as i32)?,
+            shared_mem_per_block_optin: shared_mem_per_block_optin(device_id as i32)?,
             device: Arc::new(device),
             stream,
             allocator,
@@ -177,6 +181,27 @@ impl RocmDevice {
         self.kernel_manager.mmq_tiles()
     }
 
+    /// Whether this device's architecture has AMD WMMA (matrix-core)
+    /// support; see `quantized::rocm::mmq_wmma`.
+    pub(crate) fn has_wmma(&self) -> bool {
+        self.kernel_manager.has_wmma()
+    }
+
+    /// The AMD `cc` value `quantized::rocm::mmq_wmma`'s launchers pass
+    /// through to the `mmq_gguf` kernels.
+    pub(crate) fn amd_cc(&self) -> Option<i32> {
+        self.kernel_manager.amd_cc()
+    }
+
+    /// `unit`'s compiled `mmq_gguf` shared library, compiling it on first use;
+    /// see `quantized::rocm::mmq_wmma`.
+    pub(crate) fn mmq_gguf_library(
+        &self,
+        unit: candle_rocm_kernels::MmqGgufUnit,
+    ) -> Result<std::sync::Arc<candle_rocm_kernels::MmqGgufLibrary>> {
+        self.kernel_manager.mmq_gguf_library(unit).w()
+    }
+
     pub(crate) fn param_cache(&self) -> &super::ParamCache {
         &self.param_cache
     }
@@ -187,6 +212,15 @@ impl RocmDevice {
     /// [`super::launch_config`].
     pub(crate) fn multiprocessor_count(&self) -> u32 {
         self.multiprocessor_count
+    }
+
+    /// Maximum opt-in dynamic shared memory per block, in bytes.
+    ///
+    /// Used by `quantized::rocm::mmq_wmma` to pick the widest `mmq_gguf` tile
+    /// that still fits, the same role `smpbo` plays in upstream llama.cpp's
+    /// own tile search (`mmq_gguf.cuh`'s `launch_mmq_case_*`).
+    pub(crate) fn shared_mem_per_block_optin(&self) -> i64 {
+        self.shared_mem_per_block_optin
     }
 
     pub fn id(&self) -> DeviceId {
@@ -363,4 +397,30 @@ fn multiprocessor_count(ordinal: i32) -> Result<u32> {
         )));
     }
     Ok(count.max(1) as u32)
+}
+
+/// Maximum opt-in dynamic shared memory per block, in bytes, on device
+/// `ordinal`.
+///
+/// Read once at device init, the same reasoning as
+/// [`multiprocessor_count`]: `hipDeviceGetAttribute` is a driver call and the
+/// answer is fixed for the life of the process.
+fn shared_mem_per_block_optin(ordinal: i32) -> Result<i64> {
+    use rocm_rs::hip::bindings;
+    let mut bytes: std::os::raw::c_int = 0;
+    // SAFETY: `bytes` is only read once the status has been checked.
+    let status = unsafe {
+        bindings::hipDeviceGetAttribute(
+            &mut bytes,
+            bindings::hipDeviceAttribute_t_hipDeviceAttributeSharedMemPerBlockOptin,
+            ordinal,
+        )
+    };
+    if status != bindings::hipError_t_hipSuccess {
+        return Err(rocm_error(format!(
+            "hipDeviceGetAttribute(SharedMemPerBlockOptin) failed for device {ordinal} \
+             with error {status}"
+        )));
+    }
+    Ok(i64::from(bytes))
 }

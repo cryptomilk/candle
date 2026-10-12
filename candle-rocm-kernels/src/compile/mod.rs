@@ -139,6 +139,19 @@ impl KernelCache {
         detect::mmq_tiles(&self.arch)
     }
 
+    /// Whether this device's architecture has AMD WMMA (matrix-core)
+    /// support, i.e. whether the `mmq_gguf` kernels are worth calling here
+    /// at all.
+    pub fn has_wmma(&self) -> bool {
+        detect::has_wmma(&self.arch)
+    }
+
+    /// The AMD `cc` value `mmq_gguf`'s host-side launchers expect; see
+    /// [`detect::amd_cc`].
+    pub fn amd_cc(&self) -> Option<i32> {
+        detect::amd_cc(&self.arch)
+    }
+
     /// Return the loaded module, compiling it if this is the first use.
     pub fn get_or_load(&self, module: &Module) -> Result<Arc<SendSyncModule>, KernelError> {
         self.load(ModuleName::BuiltIn(module.name()), module.source())

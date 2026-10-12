@@ -214,6 +214,80 @@ fn bench_prefill_paths() -> Result<()> {
     Ok(())
 }
 
+/// AMD WMMA matrix cores against `__dp4a`, on the same weights, for the two
+/// dtypes WMMA is wired up for ([`super::mmq_wmma::unit`]). Skips silently on
+/// anything without WMMA (RDNA2 and older), the same way the other
+/// benchmarks skip without a ROCm device at all.
+#[test]
+#[ignore = "benchmark: needs a GPU and takes seconds"]
+fn bench_wmma_vs_dp4a() -> Result<()> {
+    let device = rocm_device!();
+    let dev = match &device {
+        Device::Rocm(dev) if dev.has_wmma() => dev.clone(),
+        _ => return Ok(()),
+    };
+    println!(
+        "{:>6} {:>7} {:>6} {:>5} {:>10} {:>10} {:>8} {:>8}",
+        "dtype", "k", "n", "m", "wmma_ms", "dp4a_ms", "speedup", "spread"
+    );
+    let shapes = [
+        (512usize, 512usize),
+        (512, 1024),
+        (1024, 1024),
+        (1024, 2048),
+        (2048, 2048),
+        (2048, 4096),
+        (4096, 4096),
+        (4096, 32000),
+    ];
+    for dtype in [GgmlDType::Q4K, GgmlDType::Q6K] {
+        let unit = super::mmq_wmma::unit(dtype).expect("WMMA unit for Q4K/Q6K");
+        for (k, n) in shapes {
+            let rhs = Tensor::rand(-1f32, 1f32, (n, k), &device)?;
+            let qt = QTensor::quantize(&rhs, dtype)?;
+            let q = match &qt.storage {
+                crate::quantized::QStorage::Rocm(q) => q,
+                _ => return Ok(()),
+            };
+            for m in [9usize, 32, 128, 512] {
+                let lhs: Vec<f32> = (0..m * k).map(|i| (i as f32 / 53.).sin()).collect();
+                let y = dev.clone_htod(&lhs)?;
+                let iters = if m > 64 { 20 } else { 50 };
+                let (mut wmma, mut dp4a, mut ratio) = (vec![], vec![], vec![]);
+                for _ in 0..REPS {
+                    let wmma_ms = time(&device, iters, || {
+                        super::mmq_wmma::mul_mat_via_q8_1_mmq(
+                            &q.data, q.len, &y, 0, dtype, unit, k, n, m, &dev,
+                        )
+                        .map(|_| ())
+                    })?;
+                    let dp4a_ms = time(&device, iters, || {
+                        super::mmq::mul_mat_via_q8_1(&q.data, q.len, &y, 0, dtype, k, n, m, &dev)
+                            .map(|_| ())
+                    })?;
+                    wmma.push(wmma_ms);
+                    dp4a.push(dp4a_ms);
+                    ratio.push(dp4a_ms / wmma_ms);
+                }
+                let speedup = median(&mut ratio);
+                let spread = 100. * (ratio[REPS - 1] - ratio[0]) / speedup;
+                println!(
+                    "{:>6} {:>7} {:>6} {:>5} {:>10.4} {:>10.4} {:>8.2} {:>7.1}%",
+                    format!("{dtype:?}"),
+                    k,
+                    n,
+                    m,
+                    median(&mut wmma),
+                    median(&mut dp4a),
+                    speedup,
+                    spread
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Timing pairs per configuration in [`bench_prefill_paths`]. The two paths are
 /// timed back to back inside a repeat, so a clock or occupancy drift moves both
 /// and largely cancels in the ratio; the spread of the ratio across repeats is
