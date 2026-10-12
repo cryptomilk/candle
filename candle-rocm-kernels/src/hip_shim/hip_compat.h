@@ -114,6 +114,26 @@ __device__ __forceinline__ unsigned int __vsubss4(unsigned int a, unsigned int b
     return res;
 }
 
+// Warp-wide reductions (mmq_gguf's warp_reduce_sum/warp_reduce_max, used when
+// the CUDA source believes it has Ampere's dedicated reduction instructions).
+// HIP has no equivalent hardware op on any architecture. Both are plain
+// shuffle trees, the same fallback the CUDA source itself uses pre-Ampere.
+__device__ __forceinline__ int __reduce_add_sync(unsigned int mask, int val) {
+    (void)mask;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_xor(val, offset, 32);
+    }
+    return val;
+}
+
+__device__ __forceinline__ int __reduce_max_sync(unsigned int mask, int val) {
+    (void)mask;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val = max(val, __shfl_xor(val, offset, 32));
+    }
+    return val;
+}
+
 // ---------------------------------------------------------------------------
 // Warp shuffles
 // ---------------------------------------------------------------------------
