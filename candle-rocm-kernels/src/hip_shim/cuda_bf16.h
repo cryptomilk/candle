@@ -9,6 +9,11 @@
 typedef __hip_bfloat16 __nv_bfloat16;
 typedef __hip_bfloat162 __nv_bfloat162;
 
+// CUDA's <cuda_bf16.h> defines this single-underscore alias alongside the
+// double-underscore struct name above; mmq_gguf's AMD WMMA tile templates
+// (candle-kernels/src/mmq_gguf/mmq_mma.cuh) use the public spelling directly.
+typedef __nv_bfloat162 nv_bfloat162;
+
 // CUDA spells the NaN-propagating min/max with a `_nan` suffix. HIP's plain
 // __hmax/__hmin on bfloat16 already propagate NaN, but the suffixed names do
 // not exist, and compatibility.cuh only declares the __half variants (and only

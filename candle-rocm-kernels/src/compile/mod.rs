@@ -7,10 +7,12 @@
 mod cache;
 mod detect;
 mod hipcc;
+mod mmq_gguf;
 #[cfg(test)]
 mod tests;
 
 pub use detect::MmqTiles;
+pub use mmq_gguf::{MmqGgufLibrary, MmqGgufUnit};
 
 use crate::error::KernelError;
 use crate::wrappers::SendSyncModule;
@@ -94,6 +96,13 @@ pub struct KernelCache {
     /// modules have no slot in [`crate::ALL_IDS`], and the outer lock is only
     /// ever taken on a miss, so the extra hash costs nothing that matters.
     compiling: Mutex<HashMap<ModuleName, Arc<Mutex<()>>>>,
+    /// Loaded `mmq_gguf` shared libraries, keyed separately from `modules`:
+    /// these are `dlopen` handles, not `hipModule_t`s, and a `MmqGgufUnit` is
+    /// not a `ModuleName`.
+    mmq_gguf_libs: RwLock<HashMap<MmqGgufUnit, Arc<MmqGgufLibrary>>>,
+    /// Per-unit compile lock, the same role [`Self::compiling`] plays for
+    /// `--genco` modules.
+    mmq_gguf_compiling: Mutex<HashMap<MmqGgufUnit, Arc<Mutex<()>>>>,
 }
 
 impl KernelCache {
@@ -109,7 +118,7 @@ impl KernelCache {
         // headers differ never overwrite each other's staged copies.
         let src_dir = cache_dir.join(format!("src-{}", cache::headers_key(crate::HEADERS)));
 
-        hipcc::stage_headers(&src_dir)?;
+        hipcc::stage_headers(&src_dir, crate::HEADERS)?;
 
         Ok(Self {
             cache_dir,
@@ -118,6 +127,8 @@ impl KernelCache {
             toolchain,
             modules: RwLock::new(HashMap::new()),
             compiling: Mutex::new(HashMap::new()),
+            mmq_gguf_libs: RwLock::new(HashMap::new()),
+            mmq_gguf_compiling: Mutex::new(HashMap::new()),
         })
     }
 
@@ -131,6 +142,58 @@ impl KernelCache {
     /// Return the loaded module, compiling it if this is the first use.
     pub fn get_or_load(&self, module: &Module) -> Result<Arc<SendSyncModule>, KernelError> {
         self.load(ModuleName::BuiltIn(module.name()), module.source())
+    }
+
+    /// Return `unit`'s loaded `mmq_gguf` shared library, compiling it if this
+    /// is the first use.
+    ///
+    /// Same double-checked-locking shape as [`Self::load`], over a separate
+    /// map: an `mmq_gguf` unit compiles to a `dlopen`-able shared library
+    /// rather than a `hipModule_t`, so it cannot share [`Self::modules`]'s
+    /// storage or [`ModuleName`]'s key type.
+    pub fn mmq_gguf_library(&self, unit: MmqGgufUnit) -> Result<Arc<MmqGgufLibrary>, KernelError> {
+        {
+            let libs = self.read_mmq_gguf_libs()?;
+            if let Some(loaded) = libs.get(&unit) {
+                return Ok(loaded.clone());
+            }
+        }
+
+        let gate = {
+            let mut gates = self.mmq_gguf_compiling.lock().map_err(|_| {
+                KernelError::Internal("mmq_gguf compile gate map is poisoned".to_string())
+            })?;
+            gates.entry(unit).or_default().clone()
+        };
+        let _compiling = gate
+            .lock()
+            .map_err(|_| KernelError::Internal("mmq_gguf compile lock is poisoned".to_string()))?;
+        // Re-check: another thread may have finished while this one waited.
+        {
+            let libs = self.read_mmq_gguf_libs()?;
+            if let Some(loaded) = libs.get(&unit) {
+                return Ok(loaded.clone());
+            }
+        }
+
+        let loaded = Arc::new(mmq_gguf::compile_and_load(
+            &self.cache_dir,
+            &self.arch,
+            &self.toolchain,
+            unit,
+        )?);
+
+        let landed = {
+            let mut libs = self.write_mmq_gguf_libs()?;
+            libs.entry(unit).or_insert(loaded).clone()
+        };
+        {
+            let mut gates = self.mmq_gguf_compiling.lock().map_err(|_| {
+                KernelError::Internal("mmq_gguf compile gate map is poisoned".to_string())
+            })?;
+            gates.remove(&unit);
+        }
+        Ok(landed)
     }
 
     /// [`Self::get_or_load`] for a translation unit this crate does not own.
@@ -324,6 +387,28 @@ impl KernelCache {
         self.modules
             .write()
             .map_err(|_| KernelError::Internal("kernel module cache lock is poisoned".to_string()))
+    }
+
+    fn read_mmq_gguf_libs(
+        &self,
+    ) -> Result<
+        std::sync::RwLockReadGuard<'_, HashMap<MmqGgufUnit, Arc<MmqGgufLibrary>>>,
+        KernelError,
+    > {
+        self.mmq_gguf_libs.read().map_err(|_| {
+            KernelError::Internal("mmq_gguf library cache lock is poisoned".to_string())
+        })
+    }
+
+    fn write_mmq_gguf_libs(
+        &self,
+    ) -> Result<
+        std::sync::RwLockWriteGuard<'_, HashMap<MmqGgufUnit, Arc<MmqGgufLibrary>>>,
+        KernelError,
+    > {
+        self.mmq_gguf_libs.write().map_err(|_| {
+            KernelError::Internal("mmq_gguf library cache lock is poisoned".to_string())
+        })
     }
 }
 

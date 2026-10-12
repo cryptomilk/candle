@@ -1,4 +1,5 @@
 use super::{cache, KernelCache, ModuleName};
+use crate::MmqGgufUnit;
 use std::sync::Arc;
 
 /// A source this crate does not own, written in the same dialect as
@@ -160,4 +161,99 @@ fn a_compile_gate_is_released_once_its_module_is_resident() {
         .lock()
         .expect("gate map is poisoned")
         .is_empty());
+}
+
+/// An `mmq_gguf` unit compiles to a shared library and `dlopen`s, and its
+/// `extern "C"` launcher resolves by name. This is the whole point of the
+/// `-shared` compile path in [`super::hipcc::compile_shared_library`]: a
+/// `--genco` object has no such symbol to resolve.
+#[test]
+fn an_mmq_gguf_unit_compiles_and_resolves() {
+    let cache = match KernelCache::new(0) {
+        Ok(cache) => cache,
+        // No ROCm device on this machine.
+        Err(_) => return,
+    };
+    let lib = cache
+        .mmq_gguf_library(MmqGgufUnit::Q4K)
+        .expect("mmq_gguf Q4_K unit failed to compile");
+    // SAFETY: only resolving the symbol's address, not calling it; the
+    // function type is irrelevant to an existence check.
+    unsafe {
+        lib.get::<unsafe extern "C" fn()>(b"launch_mmq_gguf_q4_k\0")
+            .expect("launch_mmq_gguf_q4_k not found in the compiled library");
+    }
+}
+
+/// The quantize unit is a separate translation unit from the per-dtype
+/// instances and exposes three entry points, one per `block_q8_1_mmq`
+/// scale layout. All three have to resolve out of the one compiled library.
+#[test]
+fn the_mmq_gguf_quantize_unit_exposes_all_three_layouts() {
+    let cache = match KernelCache::new(0) {
+        Ok(cache) => cache,
+        Err(_) => return,
+    };
+    let lib = cache
+        .mmq_gguf_library(MmqGgufUnit::Quantize)
+        .expect("mmq_gguf quantize unit failed to compile");
+    for symbol in [
+        &b"launch_mmq_quantize_q8_1_D4\0"[..],
+        &b"launch_mmq_quantize_q8_1_DS4\0"[..],
+        &b"launch_mmq_quantize_q8_1_D2S6\0"[..],
+    ] {
+        // SAFETY: only resolving the symbol's address, not calling it.
+        unsafe {
+            lib.get::<unsafe extern "C" fn()>(symbol)
+                .unwrap_or_else(|e| panic!("{} not found: {e}", String::from_utf8_lossy(symbol)));
+        }
+    }
+}
+
+/// Two distinct `mmq_gguf` units must not collide in the library cache: the
+/// Q4_K request before this one in [`an_mmq_gguf_unit_compiles_and_resolves`]
+/// must not satisfy a Q6_K lookup, nor compile a Q6_K symbol into the Q4_K
+/// library.
+#[test]
+fn distinct_mmq_gguf_units_do_not_shadow_each_other() {
+    let cache = match KernelCache::new(0) {
+        Ok(cache) => cache,
+        Err(_) => return,
+    };
+    let q4k = cache
+        .mmq_gguf_library(MmqGgufUnit::Q4K)
+        .expect("mmq_gguf Q4_K unit failed to compile");
+    let q6k = cache
+        .mmq_gguf_library(MmqGgufUnit::Q6K)
+        .expect("mmq_gguf Q6_K unit failed to compile");
+    // SAFETY: only resolving symbol addresses, not calling them.
+    unsafe {
+        assert!(
+            q4k.get::<unsafe extern "C" fn()>(b"launch_mmq_gguf_q6_k\0")
+                .is_err(),
+            "Q6_K's launcher leaked into the Q4_K library"
+        );
+        assert!(
+            q6k.get::<unsafe extern "C" fn()>(b"launch_mmq_gguf_q4_k\0")
+                .is_err(),
+            "Q4_K's launcher leaked into the Q6_K library"
+        );
+    }
+}
+
+/// The second call for the same unit is the in-memory hit: no recompile, no
+/// re-`dlopen`, same library instance.
+#[test]
+fn an_mmq_gguf_unit_is_cached_after_first_compile() {
+    let cache = match KernelCache::new(0) {
+        Ok(cache) => cache,
+        Err(_) => return,
+    };
+    let first = cache
+        .mmq_gguf_library(MmqGgufUnit::Q6K)
+        .expect("mmq_gguf Q6_K unit failed to compile");
+    let second = cache
+        .mmq_gguf_library(MmqGgufUnit::Q6K)
+        .expect("mmq_gguf Q6_K unit failed to resolve from cache");
+    assert!(Arc::ptr_eq(&first, &second));
 }

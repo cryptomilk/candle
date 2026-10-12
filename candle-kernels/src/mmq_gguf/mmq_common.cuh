@@ -264,8 +264,10 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 }
 #endif // __CUDA_ARCH_LIST__
 
-// FP16 availability
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+// FP16 availability. Every HIP target this header supports has native fp16,
+// so HIP takes the macro unconditionally rather than through __CUDA_ARCH__,
+// matching upstream llama.cpp's own common.cuh.
+#if defined(GGML_USE_HIP) || __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
 #define FP16_AVAILABLE
 #endif
 
@@ -273,7 +275,17 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 #define FAST_FP16_AVAILABLE
 #endif
 
-// MMA (tensor core) availability
+// MMA (tensor core) availability. The whole block is excluded for
+// GGML_USE_HIP: these five are NVIDIA-only tiers, and __CUDA_ARCH__ here is
+// an NVIDIA/nvcc concept that HIP's own compiler does not define the same
+// way. This header is compiled for HIP with whatever __CUDA_ARCH__ value
+// candle-rocm-kernels passes on the command line to satisfy other,
+// unrelated feature checks. Without excluding GGML_USE_HIP, that value
+// could accidentally satisfy one of these comparisons and route an AMD
+// build into NVIDIA-only PTX intrinsics that do not exist on the AMDGPU
+// backend. Matches upstream llama.cpp's own common.cuh.
+#ifndef GGML_USE_HIP
+
 #if __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
 #define VOLTA_MMA_AVAILABLE
 #endif
@@ -294,6 +306,8 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 #define CP_ASYNC_AVAILABLE
 #endif
 
+#endif // !GGML_USE_HIP
+
 #if defined(TURING_MMA_AVAILABLE)
 #define LDMATRIX_TRANS_AVAILABLE
 #endif
@@ -303,8 +317,23 @@ static bool fp16_mma_hardware_available(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA;
 }
 
-static bool amd_mfma_available(const int /*cc*/) { return false; } // NVIDIA only
-static bool amd_wmma_available(const int /*cc*/) { return false; } // NVIDIA only
+// CDNA matrix cores (MFMA) are not wired up on the candle-rocm side yet, so
+// this always reports false here. It is independent of AMD_WMMA_AVAILABLE
+// below.
+static bool amd_mfma_available(const int /*cc*/) { return false; }
+
+// candle-rocm passes -DAMD_WMMA_AVAILABLE on the hipcc command line for
+// RDNA3/RDNA4 targets (see candle-rocm-kernels/src/compile/cache.rs). This
+// host-side query has to agree with that build-time gate: the tile sizing
+// functions below (get_mmq_x_max_host, get_mmq_y_host,
+// mmq_get_granularity_host) compute the grid the host launches, and the
+// device kernel's own get_mmq_x_max_device/mmq_get_granularity_device
+// compute the same quantities from AMD_WMMA_AVAILABLE at compile time. A
+// host answer that disagreed with the compiled device kernel would launch
+// the wrong grid for the tile size the kernel actually uses.
+static bool amd_wmma_available(const int cc) {
+    return GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
+}
 
 static bool turing_mma_available(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING;
@@ -394,7 +423,19 @@ static __device__ __forceinline__ int warp_reduce_max(int x) {
 #endif
 }
 
-// CUDA_SET_SHARED_MEMORY_LIMIT
+// CUDA_SET_SHARED_MEMORY_LIMIT. Raising the dynamic shared memory limit past
+// its default is an NVIDIA-only concern: upstream llama.cpp's own common.cuh
+// makes this a no-op under GGML_USE_HIP rather than routing the kernel
+// pointer through cudaFuncSetAttribute, because HIP's hipFuncSetAttribute
+// takes a plain `const void *` and a templated __global__ kernel name does
+// not implicitly convert to that the way it does through nvcc's handling of
+// cudaFuncSetAttribute's kernel-pointer overload.
+#if defined(GGML_USE_HIP)
+#define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes) \
+    do { \
+        (void)(nbytes); \
+    } while(0)
+#else
 #define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes) \
     do { \
         static bool raised[GGML_CUDA_MAX_DEVICES] = {false}; \
@@ -404,6 +445,7 @@ static __device__ __forceinline__ int warp_reduce_max(int x) {
             raised[dev] = true; \
         } \
     } while(0)
+#endif // defined(GGML_USE_HIP)
 
 // ============================================================
 // ggml_cuda_type_traits

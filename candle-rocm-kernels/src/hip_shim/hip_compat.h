@@ -16,6 +16,22 @@
 #include <hip/hip_bf16.h>
 
 // ---------------------------------------------------------------------------
+// CUDA Runtime API aliases
+// ---------------------------------------------------------------------------
+// mmq_gguf's host-side launcher functions spell the stream type the CUDA
+// Runtime API way directly, the same code upstream llama.cpp compiles for
+// HIP through its own, much larger compatibility header (vendors/hip.h).
+// HIP has no cudaStream_t on the AMD platform. That spelling exists only in
+// HIP's NVIDIA-platform compatibility headers, which an AMD build never
+// includes. Candle's shared candle-kernels/*.cu sources never use this name
+// directly, so this is the one alias mmq_gguf actually needs, not the much
+// larger set vendors/hip.h aliases. mmq_gguf's own CUDA_SET_SHARED_MEMORY_LIMIT
+// macro (mmq_common.cuh) is the only other CUDA Runtime API user, and it is a
+// no-op under GGML_USE_HIP, so cudaGetDevice/cudaFuncSetAttribute never need
+// an alias here.
+typedef hipStream_t cudaStream_t;
+
+// ---------------------------------------------------------------------------
 // Atomics
 // ---------------------------------------------------------------------------
 // reduce.cu's SUM_OP instantiates sum_f16 and sum_bf16, both of which need an
@@ -113,6 +129,36 @@ __device__ __forceinline__ unsigned int __vsubss4(unsigned int a, unsigned int b
     }
     return res;
 }
+
+// Per-byte subtract, used by mmq_gguf's IQ-type dot products. Matches
+// upstream llama.cpp's own HIP shim (vendors/hip.h), which reuses the
+// saturating subtract above rather than a wrapping one: the operand bytes in
+// those dot products never approach the saturation bounds, so the two give
+// the same answer, and reusing __vsubss4 avoids a second near-identical loop.
+__device__ __forceinline__ unsigned int __vsub4(unsigned int a, unsigned int b) {
+    return __vsubss4(a, b);
+}
+
+// Per-byte not-equal compare: each byte lane becomes 0xff where the two
+// inputs differ, 0x00 where they match. Used by mmq_gguf's IQ-type dot
+// products to build a sign mask.
+__device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
+    unsigned int res = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int shift = i * 8;
+        unsigned int lane = ((a >> shift) & 0xff) != ((b >> shift) & 0xff) ? 0xffu : 0x00u;
+        res |= lane << shift;
+    }
+    return res;
+}
+
+// Device-side trap. mmq_gguf's NO_DEVICE_CODE/GGML_ABORT call this directly
+// as a function rather than through CUDA's own __trap() declaration, which
+// HIP does not provide under any name. __builtin_trap() is a plain Clang
+// builtin, recognized on every backend including AMDGPU, so the macro below
+// intercepts the call before the compiler ever has to resolve __trap as an
+// identifier.
+#define __trap() __builtin_trap()
 
 // Warp-wide reductions (mmq_gguf's warp_reduce_sum/warp_reduce_max, used when
 // the CUDA source believes it has Ampere's dedicated reduction instructions).

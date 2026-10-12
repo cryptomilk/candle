@@ -20,7 +20,7 @@ mod compile;
 mod error;
 mod wrappers;
 
-pub use compile::{KernelCache, MmqTiles};
+pub use compile::{KernelCache, MmqGgufLibrary, MmqGgufUnit, MmqTiles};
 pub use error::KernelError;
 pub use wrappers::SendSyncModule;
 
@@ -33,6 +33,12 @@ macro_rules! shared_source {
 macro_rules! shim_source {
     ($file:literal) => {
         include_str!(concat!("hip_shim/", $file))
+    };
+}
+
+macro_rules! mmq_gguf_source {
+    ($file:literal) => {
+        include_str!(concat!("../../candle-kernels/src/mmq_gguf/", $file))
     };
 }
 
@@ -137,3 +143,30 @@ pub(crate) const HEADERS: &[(&str, &str)] = &[
     ("hip_shim/cuda.h", shim_source!("cuda.h")),
     ("hip_shim/cuda/std/limits", shim_source!("cuda/std/limits")),
 ];
+
+/// Headers the `mmq_gguf` AMD WMMA kernels `#include`, staged into their own
+/// directory before compilation.
+///
+/// These are compiled separately from [`HEADERS`]/[`ALL_IDS`]: the
+/// `mmq_gguf` sources are built as shared libraries
+/// ([`compile::KernelCache::mmq_gguf_library`]), not `--genco` device-only
+/// code objects, because their `extern "C"` launcher functions use `<<<>>>`
+/// kernel-launch syntax that `--genco` strips along with the rest of the
+/// host code.
+pub(crate) const MMQ_GGUF_HEADERS: &[(&str, &str)] = &[
+    ("mmq_common.cuh", mmq_gguf_source!("mmq_common.cuh")),
+    ("mmq_gguf.cuh", mmq_gguf_source!("mmq_gguf.cuh")),
+    ("mmq_mma.cuh", mmq_gguf_source!("mmq_mma.cuh")),
+    ("mmq_vecdotq.cuh", mmq_gguf_source!("mmq_vecdotq.cuh")),
+];
+
+/// `mmq_quantize.cu`'s source: the `f32 -> block_q8_1_mmq` activation
+/// requantization the `mmq_gguf` kernels read from. Compiled once, shared by
+/// every [`MmqGgufUnit`].
+pub(crate) const MMQ_GGUF_QUANTIZE_SRC: &str = mmq_gguf_source!("mmq_quantize.cu");
+
+/// `mmq_instance_q4_k.cu`'s source.
+pub(crate) const MMQ_GGUF_Q4_K_SRC: &str = mmq_gguf_source!("mmq_instance_q4_k.cu");
+
+/// `mmq_instance_q6_k.cu`'s source.
+pub(crate) const MMQ_GGUF_Q6_K_SRC: &str = mmq_gguf_source!("mmq_instance_q6_k.cu");

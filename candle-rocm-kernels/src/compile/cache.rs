@@ -27,11 +27,12 @@ pub(crate) const COMPILE_FLAGS: &[&str] = &["--genco", "-O3", "-std=c++17", "-D_
 /// MMQ tile geometry in `quantized.cu`. Same rule as [`COMPILE_FLAGS`] — a
 /// single definition feeds both the command line and the cache key.
 ///
-/// It goes on every translation unit, not just `quantized.cu`, which is safe
-/// because that is the only source this crate compiles that tests for it. The
-/// `RDNA3`/`RDNA4` machinery in `candle-kernels/src/mmq_gguf` is a CUDA-only
-/// tree: none of the modules in [`crate::ALL_IDS`] includes it, and it is not
-/// among the staged [`crate::HEADERS`], so hipcc never sees it.
+/// It goes on every `--genco` translation unit in [`crate::ALL_IDS`], not
+/// just `quantized.cu`, which is safe because that is the only one of them
+/// that tests for it. The `mmq_gguf` AMD WMMA kernels also test for this
+/// define, but they are not in [`crate::ALL_IDS`] and are not compiled
+/// through this flag set at all: see [`super::KernelCache::mmq_gguf_library`]
+/// for their own, separate compile flags.
 pub(crate) fn arch_flag(arch: &str) -> Option<String> {
     super::detect::rdna_define(arch).map(|define| format!("-D{define}"))
 }
@@ -63,6 +64,31 @@ pub(crate) fn module_key(
         field(&mut hasher, flag.as_bytes());
     }
     if let Some(flag) = arch_flag(arch) {
+        field(&mut hasher, flag.as_bytes());
+    }
+    field(&mut hasher, source.as_bytes());
+    hasher.update(headers_digest(headers));
+    truncated_hex(hasher)
+}
+
+/// Cache key for one `mmq_gguf` shared-library compile.
+///
+/// Mirrors [`module_key`]'s reasoning but over an `mmq_gguf` unit's own flag
+/// set rather than [`COMPILE_FLAGS`]: those compile to a `-shared` library,
+/// not a `--genco` code object, and carry `-DGGML_USE_HIP`/
+/// `-DAMD_WMMA_AVAILABLE` instead of plain `-DRDNA*`.
+pub(crate) fn mmq_gguf_key(
+    source: &str,
+    flags: &[&str],
+    headers: &[(&str, &str)],
+    arch: &str,
+    toolchain: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    field(&mut hasher, env!("CARGO_PKG_VERSION").as_bytes());
+    field(&mut hasher, arch.as_bytes());
+    field(&mut hasher, toolchain.as_bytes());
+    for flag in flags {
         field(&mut hasher, flag.as_bytes());
     }
     field(&mut hasher, source.as_bytes());
@@ -235,6 +261,12 @@ pub(crate) fn lock_entry(cache_dir: &Path, entry: &str) -> Result<LockFile, Kern
 /// Write via a unique temporary in the destination directory, then rename.
 /// Concurrent compilers (parallel test threads, several processes) would
 /// otherwise observe a half-written file.
+///
+/// The temporary name includes both the process id and a per-process counter:
+/// the pid alone separates concurrent *processes*, but two threads of the
+/// same process staging the same header for the first time share a pid, and
+/// would otherwise race to write and rename the identical tmp path, so that
+/// one thread's rename can find the other's tmp file already gone.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), KernelError> {
     let parent = path
         .parent()
@@ -242,8 +274,11 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), KernelErr
     fs::create_dir_all(parent)
         .map_err(|e| KernelError::Io(format!("could not create {}: {e}", parent.display())))?;
 
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let tmp = parent.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{unique}.tmp",
         path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("staged"),

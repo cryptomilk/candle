@@ -64,6 +64,64 @@ pub(crate) fn compile(
     binary
 }
 
+/// hipcc the source into a shared library, rather than a `--genco`
+/// device-only code object.
+///
+/// The `mmq_gguf` kernels' `extern "C"` launcher functions use `<<<>>>`
+/// kernel-launch syntax, which only lowers to a real kernel-launch call when
+/// hipcc also emits host code, exactly what `--genco` strips. A `-shared
+/// -fPIC` build instead produces an ordinary ELF shared library with the
+/// device code embedded as a fat binary and the host-side launch glue hipcc
+/// generates for `<<<>>>`. Unlike [`compile`] there is no unbundling step
+/// afterward: the result already loads with `dlopen`.
+pub(crate) fn compile_shared_library(
+    src_dir: &Path,
+    out_path: &Path,
+    arch: &str,
+    name: &str,
+    entry: &str,
+    source: &str,
+    extra_flags: &[&str],
+) -> Result<(), KernelError> {
+    let src_file = src_dir.join(format!("{entry}.cu"));
+    cache::write_atomic(&src_file, source.as_bytes())?;
+
+    let shim_dir = src_dir.join("hip_shim");
+
+    let output = Command::new("hipcc")
+        .arg("-shared")
+        .arg("-fPIC")
+        .arg("-O3")
+        .arg("-std=c++17")
+        .args(extra_flags)
+        .arg(format!("--offload-arch={arch}"))
+        .arg("-include")
+        .arg(shim_dir.join("hip_compat.h"))
+        // Shim first: its cuda_*.h shadow the CUDA toolkit headers.
+        .arg("-I")
+        .arg(&shim_dir)
+        .arg("-I")
+        .arg(src_dir)
+        .arg("-o")
+        .arg(out_path)
+        .arg(&src_file)
+        .output()
+        .map_err(|e| {
+            KernelError::Compilation(format!("could not run hipcc: {e}. Is ROCm installed?"))
+        })?;
+
+    if !output.status.success() {
+        return Err(KernelError::Compilation(format!(
+            "hipcc -shared failed for `{}` ({}):\n{}",
+            name,
+            arch,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
 /// Extract the single-arch code object from a clang offload bundle.
 fn unbundle(bundle: &Path, arch: &str) -> Result<Vec<u8>, KernelError> {
     // `bundle` is already process-unique, so this derived name is too.
@@ -114,14 +172,15 @@ fn staged_dirs() -> &'static Mutex<HashSet<PathBuf>> {
     STAGED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Write the staged sources the compiler needs to `#include`.
+/// Write `headers` into `src_dir` for the compiler to `#include`.
 ///
-/// `src_dir` is named after the digest of this exact header set, so a directory
-/// carrying the completion marker already holds the right contents. The marker
-/// is written last and atomically: a run that crashed mid-staging leaves no
-/// marker, and the next one rewrites everything rather than trusting a file it
-/// may have truncated.
-pub(crate) fn stage_headers(src_dir: &Path) -> Result<(), KernelError> {
+/// `src_dir` is named after the digest of this exact header set (see
+/// [`cache::headers_key`]), so a directory carrying the completion marker
+/// already holds the right contents. The marker is written last and
+/// atomically: a run that crashed mid-staging leaves no marker, and the next
+/// one rewrites everything rather than trusting a file it may have
+/// truncated.
+pub(crate) fn stage_headers(src_dir: &Path, headers: &[(&str, &str)]) -> Result<(), KernelError> {
     let staged = staged_dirs();
     if let Ok(seen) = staged.lock() {
         if seen.contains(src_dir) {
@@ -131,7 +190,7 @@ pub(crate) fn stage_headers(src_dir: &Path) -> Result<(), KernelError> {
 
     let marker = src_dir.join(".staged");
     if !marker.is_file() {
-        for (rel_path, contents) in crate::HEADERS {
+        for (rel_path, contents) in headers {
             let path = src_dir.join(rel_path);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|e| {
